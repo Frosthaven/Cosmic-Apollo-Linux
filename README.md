@@ -22,6 +22,7 @@ seamlessly with Cosmic's compositor and misc tooling.
 - **Quick reconnect** - disconnecting and reconnecting from the same device is sub-second; the virtual display stays warm.
 - **Self-healing** - if apollo crashes mid-stream, the next start automatically turns your physical monitors back on, restores audio, re-enables tiling.
 - **Disconnect vs Quit Session do the right thing** - Disconnect leaves the app paused so you can resume; Quit Session actually closes it.
+- **Per-client display scale memory** - whatever cosmic-comp scale you set on the virtual display while streaming is remembered against the connecting client. Reconnect from the same client and the virtual display comes back at that scale. Brand-new clients start at 100% for a deterministic baseline. Only the first/sole client of a session sets the scale; followers inherit.
 
 ## Requirements
 
@@ -31,7 +32,7 @@ seamlessly with Cosmic's compositor and misc tooling.
 
 ## Installing
 
-> **Note**: Releases will be on the [GitHub Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases) once stabilized. For now, build from source.
+Pre-built `.deb`, `.rpm`, Arch tarball, and `.AppImage` artifacts are on the [GitHub Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases). Build-from-source instructions below if you'd rather track master.
 
 ```bash
 # Install build + runtime deps (Arch / CachyOS)
