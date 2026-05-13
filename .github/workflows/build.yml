@@ -341,7 +341,6 @@ jobs:
           EOF
 
           dpkg-deb --build ${PKGDIR}
-          mv ${PKGDIR}.deb cosmic-apollo_${VERSION}_amd64.deb
 
       - name: Upload DEB Package
         uses: actions/upload-artifact@v4
