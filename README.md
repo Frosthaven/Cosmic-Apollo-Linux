@@ -25,8 +25,7 @@ seamlessly with Cosmic's compositor and misc tooling.
 
 ## Requirements
 
-- **Arch Linux or derivative** (CachyOS, EndeavourOS, etc.) - official packaging targets Arch. Other distros work if you build from source.
-- **COSMIC desktop** running on Wayland.
+- **A Linux distro that runs COSMIC on Wayland.** Pre-built packages are produced for Debian/Ubuntu/Pop!_OS (`.deb`), Fedora (`.rpm`), Arch (`.tar.gz`), and a distro-agnostic `.AppImage`. Building from source also works.
 - **EVDI** kernel module + library - install `evdi-dkms` and `libevdi` from your package manager.
 - **A modern GPU** for hardware encoding (any NVIDIA, AMD VAAPI-capable, or Intel UHD).
 

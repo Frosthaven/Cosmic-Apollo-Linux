@@ -1,0 +1,544 @@
+name: Build Cosmic-Apollo-Linux
+
+on:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # ===========================================
+  # Linux AppImage Build (Ubuntu 24.04 for newer libs)
+  # ===========================================
+  build-linux-appimage:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            libboost-all-dev \
+            libpulse-dev \
+            libopus-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libdrm-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxfixes-dev \
+            libxcb1-dev \
+            libxcb-shm0-dev \
+            libxcb-xfixes0-dev \
+            libva-dev \
+            libvdpau-dev \
+            libcap-dev \
+            libcurl4-openssl-dev \
+            libnotify-dev \
+            libayatana-appindicator3-dev \
+            libevdev-dev \
+            libudev-dev \
+            libsystemd-dev \
+            libminiupnpc-dev \
+            libfuse2 \
+            libicu-dev \
+            libnuma-dev \
+            wget \
+            nodejs \
+            npm
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DSUNSHINE_ENABLE_WAYLAND=ON \
+            -DSUNSHINE_ENABLE_X11=ON \
+            -DSUNSHINE_ENABLE_DRM=ON \
+            -DSUNSHINE_ENABLE_CUDA=OFF \
+            -DFETCHCONTENT_FULLY_DISCONNECTED=OFF
+
+      - name: Build
+        run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(nproc)
+
+      - name: Install to AppDir
+        run: |
+          DESTDIR=${{github.workspace}}/AppDir cmake --install build
+
+      - name: Create AppImage
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+
+          mkdir -p AppDir/usr/share/applications
+          cat > AppDir/usr/share/applications/apollo.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Apollo
+          Comment=Self-hosted game stream host
+          Exec=apollo
+          Icon=apollo
+          Type=Application
+          Categories=Network;RemoteAccess;
+          EOF
+
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --output appimage \
+            --desktop-file AppDir/usr/share/applications/apollo.desktop \
+            || echo "AppImage creation had issues, continuing..."
+
+          mv Apollo*.AppImage cosmic-apollo-linux-x86_64.AppImage 2>/dev/null || true
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmic-apollo-linux-appimage
+          path: "*.AppImage"
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ===========================================
+  # Arch Linux Package (tarball)
+  # ===========================================
+  build-arch-pkg:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Setup Arch Linux
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            base-devel \
+            git \
+            cmake \
+            ninja \
+            boost \
+            openssl \
+            opus \
+            ffmpeg \
+            libdrm \
+            wayland \
+            libx11 \
+            libxrandr \
+            libxfixes \
+            libxcb \
+            libva \
+            libvdpau \
+            libcap \
+            curl \
+            libnotify \
+            libayatana-appindicator \
+            libevdev \
+            systemd \
+            miniupnpc \
+            libpulse \
+            npm \
+            nodejs \
+            icu \
+            numactl
+
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Fix permissions and git
+        run: |
+          chown -R builder:builder .
+          git config --global --add safe.directory /__w/Cosmic-Apollo-Linux/Cosmic-Apollo-Linux
+
+      - name: Build with CMake
+        run: |
+          su builder -c '
+            cmake -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=/usr \
+              -DSUNSHINE_ENABLE_WAYLAND=ON \
+              -DSUNSHINE_ENABLE_X11=ON \
+              -DSUNSHINE_ENABLE_DRM=ON \
+              -DSUNSHINE_ENABLE_CUDA=OFF
+            cmake --build build -j$(nproc)
+          '
+
+      - name: Create Package
+        run: |
+          mkdir -p pkg/usr/bin pkg/usr/share/apollo
+          cp build/sunshine* pkg/usr/bin/apollo 2>/dev/null || true
+          chmod 755 pkg/usr/bin/apollo 2>/dev/null || true
+          cp -r build/assets/* pkg/usr/share/apollo/ 2>/dev/null || true
+
+          cd pkg && tar -czvf ../cosmic-apollo-linux-x86_64.tar.gz .
+
+      - name: Upload Arch Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmic-apollo-arch-pkg
+          path: "*.tar.gz"
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ===========================================
+  # Debian/Ubuntu Package (.deb)
+  # ===========================================
+  build-deb:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            libboost-all-dev \
+            libpulse-dev \
+            libopus-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libdrm-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxfixes-dev \
+            libxcb1-dev \
+            libxcb-shm0-dev \
+            libxcb-xfixes0-dev \
+            libva-dev \
+            libvdpau-dev \
+            libcap-dev \
+            libcurl4-openssl-dev \
+            libnotify-dev \
+            libayatana-appindicator3-dev \
+            libevdev-dev \
+            libudev-dev \
+            libsystemd-dev \
+            libminiupnpc-dev \
+            libicu-dev \
+            libnuma-dev \
+            dpkg-dev \
+            debhelper \
+            nodejs \
+            npm
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DSUNSHINE_ENABLE_WAYLAND=ON \
+            -DSUNSHINE_ENABLE_X11=ON \
+            -DSUNSHINE_ENABLE_DRM=ON \
+            -DSUNSHINE_ENABLE_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(nproc)
+
+      - name: Create DEB Package
+        run: |
+          VERSION="0.1.0"
+          PKGDIR="cosmic-apollo_${VERSION}_amd64"
+
+          mkdir -p ${PKGDIR}/DEBIAN
+          mkdir -p ${PKGDIR}/usr/bin
+          mkdir -p ${PKGDIR}/usr/share/apollo
+          mkdir -p ${PKGDIR}/usr/share/applications
+          mkdir -p ${PKGDIR}/usr/share/icons/hicolor/scalable/apps
+          mkdir -p ${PKGDIR}/usr/share/icons/hicolor/scalable/status
+          mkdir -p ${PKGDIR}/usr/lib/systemd/user
+
+          cp build/sunshine* ${PKGDIR}/usr/bin/apollo 2>/dev/null || true
+          chmod 755 ${PKGDIR}/usr/bin/apollo 2>/dev/null || true
+
+          cp -r build/assets/web ${PKGDIR}/usr/share/apollo/ 2>/dev/null || true
+          cp build/assets/*.png build/assets/*.json ${PKGDIR}/usr/share/apollo/ 2>/dev/null || true
+
+          cp src_assets/linux/misc/icons/*.svg ${PKGDIR}/usr/share/icons/hicolor/scalable/apps/ 2>/dev/null || true
+
+          cat > ${PKGDIR}/DEBIAN/control << EOF
+          Package: cosmic-apollo
+          Version: ${VERSION}
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Depends: libssl3, libboost-all-dev, libpulse0, libopus0, libdrm2, libwayland-client0, libx11-6, libva2, libcurl4, libnotify4, libayatana-appindicator3-1, libevdev2, libcap2
+          Recommends: evdi-dkms
+          Maintainer: Frosthaven <noreply@github.com>
+          Homepage: https://github.com/Frosthaven/Cosmic-Apollo-Linux
+          Description: COSMIC-tuned Apollo game streaming host with virtual display support
+           Cosmic-Apollo-Linux is a fork of Apollo-Linux (itself a fork of Sunshine)
+           tuned specifically for the COSMIC desktop environment on Wayland. Uses
+           EVDI to present a virtual display so streaming clients get a real screen
+           instead of mirroring the desktop.
+          EOF
+
+          cat > ${PKGDIR}/DEBIAN/postinst << 'EOF'
+          #!/bin/bash
+          set -e
+          setcap cap_sys_admin+p /usr/bin/apollo || true
+          if command -v modprobe &> /dev/null; then
+            modprobe evdi 2>/dev/null || true
+          fi
+          gtk-update-icon-cache -f /usr/share/icons/hicolor/ 2>/dev/null || true
+          EOF
+          chmod 755 ${PKGDIR}/DEBIAN/postinst
+
+          cat > ${PKGDIR}/usr/lib/systemd/user/apollo.service << 'EOF'
+          [Unit]
+          Description=Cosmic-Apollo game streaming host
+          After=cosmic-session.target graphical-session.target
+          PartOf=graphical-session.target
+          StartLimitIntervalSec=500
+          StartLimitBurst=5
+
+          [Service]
+          Type=simple
+          ExecStartPre=/bin/sleep 5
+          ExecStartPre=/bin/sh -c 'until [ -n "$WAYLAND_DISPLAY" ]; do sleep 0.5; done'
+          ExecStart=/usr/bin/apollo
+          Restart=on-failure
+          RestartSec=2
+
+          [Install]
+          WantedBy=graphical-session.target
+          EOF
+
+          cat > ${PKGDIR}/usr/share/applications/apollo.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Apollo
+          Comment=Self-hosted game stream host (COSMIC)
+          Exec=/usr/bin/env systemctl start --user apollo
+          Icon=apollo
+          Type=Application
+          Categories=Network;RemoteAccess;
+          EOF
+
+          dpkg-deb --build ${PKGDIR}
+          mv ${PKGDIR}.deb cosmic-apollo_${VERSION}_amd64.deb
+
+      - name: Upload DEB Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmic-apollo-deb
+          path: "*.deb"
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ===========================================
+  # Fedora RPM Build
+  # ===========================================
+  build-rpm:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:40
+
+    steps:
+      - name: Install Dependencies
+        run: |
+          dnf install -y \
+            git \
+            cmake \
+            ninja-build \
+            gcc-c++ \
+            boost-devel \
+            openssl-devel \
+            opus-devel \
+            ffmpeg-free-devel \
+            libdrm-devel \
+            wayland-devel \
+            libX11-devel \
+            libXrandr-devel \
+            libXfixes-devel \
+            libxcb-devel \
+            libva-devel \
+            libvdpau-devel \
+            libcap-devel \
+            libcurl-devel \
+            libnotify-devel \
+            libayatana-appindicator-gtk3-devel \
+            libevdev-devel \
+            systemd-devel \
+            miniupnpc-devel \
+            pulseaudio-libs-devel \
+            libicu-devel \
+            numactl-devel \
+            rpm-build \
+            nodejs \
+            npm
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory /__w/Cosmic-Apollo-Linux/Cosmic-Apollo-Linux
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DSUNSHINE_ENABLE_WAYLAND=ON \
+            -DSUNSHINE_ENABLE_X11=ON \
+            -DSUNSHINE_ENABLE_DRM=ON \
+            -DSUNSHINE_ENABLE_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Create RPM Package
+        run: |
+          VERSION="0.1.0"
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          mkdir -p cosmic-apollo-${VERSION}/usr/bin
+          mkdir -p cosmic-apollo-${VERSION}/usr/share/apollo
+          cp build/sunshine* cosmic-apollo-${VERSION}/usr/bin/apollo 2>/dev/null || true
+          chmod 755 cosmic-apollo-${VERSION}/usr/bin/apollo 2>/dev/null || true
+          cp -r build/assets/* cosmic-apollo-${VERSION}/usr/share/apollo/ 2>/dev/null || true
+          tar -czvf ~/rpmbuild/SOURCES/cosmic-apollo-${VERSION}.tar.gz cosmic-apollo-${VERSION}
+
+          cat > ~/rpmbuild/SPECS/cosmic-apollo.spec << 'EOF'
+          Name:           cosmic-apollo
+          Version:        0.1.0
+          Release:        1%{?dist}
+          Summary:        COSMIC-tuned Apollo game streaming host with virtual display support
+          License:        GPLv3
+          URL:            https://github.com/Frosthaven/Cosmic-Apollo-Linux
+          Source0:        cosmic-apollo-%{version}.tar.gz
+          Recommends:     evdi
+
+          %description
+          Cosmic-Apollo-Linux is a fork of Apollo-Linux (itself a fork of Sunshine)
+          tuned specifically for the COSMIC desktop environment on Wayland. Uses
+          EVDI to present a virtual display so streaming clients get a real screen
+          instead of mirroring the desktop.
+
+          %prep
+          %setup -q
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/usr/share/apollo
+          cp -r usr/bin/* %{buildroot}/usr/bin/ || true
+          cp -r usr/share/apollo/* %{buildroot}/usr/share/apollo/ || true
+
+          %files
+          %attr(755,root,root) /usr/bin/apollo
+          /usr/share/apollo
+
+          %post
+          setcap cap_sys_admin+p /usr/bin/apollo || true
+          EOF
+
+          rpmbuild -bb ~/rpmbuild/SPECS/cosmic-apollo.spec || echo "RPM build had issues"
+          cp ~/rpmbuild/RPMS/*/*.rpm . 2>/dev/null || true
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmic-apollo-rpm
+          path: "*.rpm"
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ===========================================
+  # Draft Release (always, manual + tag triggered)
+  # ===========================================
+  release:
+    name: Draft Release
+    needs: [build-linux-appimage, build-arch-pkg, build-deb, build-rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          find artifacts/ -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o -name '*.tar.gz' \) -exec cp {} release/ \;
+          echo "Release contents:"
+          ls -la release/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          LAST_TAG=$(gh release list --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+
+          if [ -n "$LAST_TAG" ] && git rev-parse "$LAST_TAG" >/dev/null 2>&1; then
+            COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"- [%h](https://github.com/${{ github.repository }}/commit/%H) %s" --)
+          else
+            COMMITS=$(git log --pretty=format:"- [%h](https://github.com/${{ github.repository }}/commit/%H) %s" --)
+          fi
+
+          if [ -z "$COMMITS" ]; then
+            COMMITS="- No new commits since last release"
+          fi
+
+          EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "commits<<$EOF_MARKER" >> "$GITHUB_OUTPUT"
+          echo "$COMMITS" >> "$GITHUB_OUTPUT"
+          echo "$EOF_MARKER" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: release/*
+          body: |
+            ## Changes since last release
+
+            ${{ steps.notes.outputs.commits }}
+
+            ## Downloads
+
+            - **`.AppImage`** - universal Linux binary, no install needed (most distros)
+            - **`.deb`** - Debian, Ubuntu, Pop!_OS
+            - **`.rpm`** - Fedora (incl. COSMIC Spin)
+            - **`.tar.gz`** - Arch Linux (extract over `/`)
+
+            EVDI kernel module is required at runtime - see the [README](https://github.com/${{ github.repository }}#requirements) for setup.
