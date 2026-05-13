@@ -286,7 +286,7 @@ jobs:
           Section: net
           Priority: optional
           Architecture: amd64
-          Depends: libssl3, libboost-all-dev, libpulse0, libopus0, libdrm2, libwayland-client0, libx11-6, libva2, libcurl4, libnotify4, libayatana-appindicator3-1, libevdev2, libcap2
+          Depends: libssl3, libpulse0, libopus0, libdrm2, libwayland-client0, libx11-6, libva2, libcurl4, libnotify4, libayatana-appindicator3-1, libevdev2, libcap2
           Recommends: evdi-dkms
           Maintainer: Frosthaven <noreply@github.com>
           Homepage: https://github.com/Frosthaven/Cosmic-Apollo-Linux
@@ -365,7 +365,6 @@ jobs:
             cmake \
             ninja-build \
             gcc-c++ \
-            boost-devel \
             openssl-devel \
             opus-devel \
             ffmpeg-free-devel \
