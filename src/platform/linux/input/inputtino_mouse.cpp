@@ -27,7 +27,21 @@ namespace platf::mouse {
 
   void move_abs(input_raw_t *raw, const touch_port_t &touch_port, float x, float y) {
     if (raw->mouse) {
-      (*raw->mouse).move_abs(x, y, touch_port.width, touch_port.height);
+      // Translate from captured-display coordinates into the global
+      // compositor frame so absolute pointer events land on the captured
+      // output (e.g. an EVDI virtual display at offset (5920, 0)) rather
+      // than always scaling across the entire desktop with origin at (0,0).
+      //
+      // At the platf layer, touch_port.width/height already carry the full
+      // compositor desktop extent (input.cpp packs env_width/env_height into
+      // those slots when constructing the abs_port). The only missing piece
+      // for multi-output captures was the origin shift, which we apply here.
+      float gx = x + static_cast<float>(touch_port.offset_x);
+      float gy = y + static_cast<float>(touch_port.offset_y);
+      (*raw->mouse).move_abs(static_cast<int>(gx),
+                              static_cast<int>(gy),
+                              touch_port.width,
+                              touch_port.height);
     }
   }
 

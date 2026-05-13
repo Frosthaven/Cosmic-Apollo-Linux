@@ -35,6 +35,7 @@
 
 // local includes
 #include "graphics.h"
+#include "virtual_display.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/entry_handler.h"
@@ -909,6 +910,12 @@ std::string get_local_ip_for_gateway() {
   }
 #endif
 
+  // EVDI virtual-display capture (libevdi consumer). Defined in evdi_grab.cpp.
+  std::shared_ptr<display_t> evdi_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
+  std::vector<std::string> evdi_display_names();
+  void evdi_grab_startup_recovery();
+  void audio_startup_recovery();
+
 #ifdef SUNSHINE_BUILD_X11
   std::vector<std::string> x11_display_names();
   std::shared_ptr<display_t> x11_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
@@ -953,6 +960,36 @@ std::string get_local_ip_for_gateway() {
   }
 
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    // If the requested display is a VDISPLAY-managed EVDI virtual display,
+    // route capture through libevdi rather than KMS/wlroots/etc. The kernel
+    // EVDI module only delivers frames to a libevdi consumer; if no one
+    // consumes them, cosmic-comp's page flips on the EVDI card stall and
+    // KMS capture sees stale or absent buffers (the bug behind the
+    // upstream Apollo-Linux's headless mode being broken on Linux).
+    //
+    // Also catch the empty-display_name path: the encoder probe runs with
+    // an empty config::video.output_name on first invocation and would
+    // otherwise fall through to KMS. KMS then opens the physical DRM card
+    // the user's main monitor is on and contends with cosmic-comp's page-
+    // flip stream — cosmic-comp's renderer fails with EBUSY and the user's
+    // desk goes dark.
+    std::string evdi_route_name = display_name;
+    if (evdi_route_name.empty() || !VDISPLAY::isEvdiDisplay(evdi_route_name)) {
+      auto active = VDISPLAY::firstActiveEvdiName();
+      if (!active.empty()) {
+        evdi_route_name = active;
+      }
+    }
+    if (!evdi_route_name.empty() && VDISPLAY::isEvdiDisplay(evdi_route_name)) {
+      BOOST_LOG(info) << "Screencasting with EVDI virtual display: "sv << evdi_route_name;
+      auto disp = evdi_display(hwdevice_type, evdi_route_name, config);
+      if (disp) {
+        return disp;
+      }
+      BOOST_LOG(warning) << "EVDI capture init failed for "sv << evdi_route_name
+                          << "; falling back to default backend"sv;
+    }
+
 #ifdef SUNSHINE_BUILD_CUDA
     if (sources[source::NVFBC] && hwdevice_type == mem_type_e::cuda) {
       BOOST_LOG(info) << "Screencasting with NvFBC"sv;
@@ -985,6 +1022,16 @@ std::string get_local_ip_for_gateway() {
     // enable low latency mode for AMD
     // https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/30039
     set_env("AMD_DEBUG", "lowlatencyenc");
+
+    // Re-enable any outputs a prior session disabled but never restored
+    // (apollo crash / hang-killed / user hard-reset). Safe no-op when
+    // there's no leftover state file.
+    evdi_grab_startup_recovery();
+    // Same idea for the user's PulseAudio default sink — apollo's
+    // disconnect path normally restores it, but if apollo died mid-stream
+    // the user is left on a sink-sunshine-* virtual with no audio. This
+    // reads ~/.cache/apollo/original-audio-sink and switches back.
+    audio_startup_recovery();
 
     // These are allowed to fail.
     gbm::init();

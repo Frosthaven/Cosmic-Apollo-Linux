@@ -1706,4 +1706,30 @@ namespace input {
 
     return input;
   }
+
+  void warp_cursor(int x, int y, int /*total_width*/, int /*total_height*/) {
+    // Cross-output cursor warping on Wayland is awkward:
+    //   - platf::abs_mouse goes through libinput's calibration matrix, which
+    //     scopes the virtual abs device to a single output (typically the
+    //     primary). Coords land on the wrong display.
+    //   - platf::move_mouse sends EV_REL; libinput's pointer-acceleration
+    //     curve makes large deltas land somewhere unpredictable.
+    //
+    // ydotool's mousemove --absolute talks to /dev/uinput directly with a
+    // long-lived absolute device whose axes map to the full compositor
+    // desktop. cosmic-comp honors that mapping cleanly, so it's the only
+    // approach that reliably puts the cursor on whichever output we ask for.
+    if (x < 0 || y < 0) {
+      return;
+    }
+    char cmd[128];
+    std::snprintf(cmd, sizeof(cmd),
+                  "ydotool mousemove --absolute -x %d -y %d 2>/dev/null",
+                  x, y);
+    int rc = std::system(cmd);
+    if (rc != 0) {
+      BOOST_LOG(warning) << "warp_cursor: ydotool mousemove returned " << rc
+                          << " (is the ydotool user service running?)";
+    }
+  }
 }  // namespace input

@@ -46,4 +46,17 @@ namespace input {
    * @return The major and minor axis pair.
    */
   std::pair<float, float> scale_client_contact_area(const std::pair<float, float> &val, uint16_t rotation, const std::pair<float, float> &scalar);
+
+  /**
+   * @brief Warp the cursor to the absolute compositor coordinate (x, y).
+   *        Used by capture backends to focus a fresh capture target — most
+   *        notably an EVDI virtual display sitting at some non-zero offset
+   *        in the global desktop — so the user doesn't have to drag the
+   *        cursor across from the physical screen on first connect.
+   * @param x Global compositor X coordinate.
+   * @param y Global compositor Y coordinate.
+   * @param total_width  Full compositor desktop width (the abs scale denom).
+   * @param total_height Full compositor desktop height.
+   */
+  void warp_cursor(int x, int y, int total_width, int total_height);
 }  // namespace input

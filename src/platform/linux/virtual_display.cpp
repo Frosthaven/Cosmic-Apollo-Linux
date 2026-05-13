@@ -22,7 +22,11 @@
 #include <vector>
 
 // platform includes
+#include <cerrno>
+#include <chrono>
+#include <ctime>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <xf86drm.h>
@@ -132,6 +136,7 @@ namespace VDISPLAY {
   typedef void (*fn_evdi_handle_events)(evdi_handle handle, struct evdi_event_context *evtctx);
   typedef int (*fn_evdi_get_event_ready)(evdi_handle handle);
   typedef void (*fn_evdi_get_lib_version)(struct evdi_lib_version *version);
+  typedef void (*fn_evdi_enable_cursor_events)(evdi_handle handle, bool enable);
 
   // EVDI function pointers (loaded at runtime)
   static struct {
@@ -149,9 +154,11 @@ namespace VDISPLAY {
     fn_evdi_handle_events handle_events;
     fn_evdi_get_event_ready get_event_ready;
     fn_evdi_get_lib_version get_lib_version;
+    fn_evdi_enable_cursor_events enable_cursor_events;
     bool loaded;
   } evdi = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false};
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, false};
 
   // ============================================================================
   // Standard 1920x1080 EDID (used for virtual display)
@@ -219,6 +226,85 @@ namespace VDISPLAY {
 
   static std::map<std::string, VirtualDisplayInfo> virtual_displays;
 
+  // Per-display capture state. Kept in a separate map keyed by GUID string so
+  // VirtualDisplayInfo stays copyable (atomic/mutex would break that). Held by
+  // unique_ptr because mutex/atomic also disallow move from external code.
+  struct CaptureState {
+    std::vector<uint8_t> buffer;        ///< CPU memory the kernel writes pixels into
+    std::vector<evdi_rect> dirty_rects; ///< preallocated grab_pixels output
+    int buffer_id;                       ///< id passed to evdi_register_buffer
+    int width;                            ///< buffer width in pixels
+    int height;                           ///< buffer height in pixels
+    int stride;                           ///< buffer stride in bytes
+    std::atomic<bool> update_ready;      ///< set by update_ready_handler callback
+    std::atomic<bool> mode_ready;        ///< set true after mode_changed callback or first frame
+    std::atomic<int> mode_width;         ///< latest mode width reported by EVDI (0 = unknown)
+    std::atomic<int> mode_height;        ///< latest mode height reported by EVDI
+    std::mutex grab_mutex;                ///< serializes grab_pixels with reads
+
+    // Cursor compositing. EVDI delivers cursor pixels and position via
+    // cursor_set / cursor_move callbacks rather than baking them into the
+    // primary framebuffer. We keep a local copy so the capture loop can
+    // composite it onto the output before handing the frame to the encoder.
+    std::mutex cursor_mutex;
+    std::vector<uint8_t> cursor_pixels;  ///< BGRA, width*height*4 bytes
+    int cursor_width;
+    int cursor_height;
+    int cursor_hot_x;
+    int cursor_hot_y;
+    std::atomic<int> cursor_pos_x;
+    std::atomic<int> cursor_pos_y;
+    std::atomic<bool> cursor_enabled;
+
+    CaptureState():
+        buffer_id(0),
+        width(0),
+        height(0),
+        stride(0),
+        update_ready(false),
+        mode_ready(false),
+        mode_width(0),
+        mode_height(0),
+        cursor_width(0),
+        cursor_height(0),
+        cursor_hot_x(0),
+        cursor_hot_y(0),
+        cursor_pos_x(0),
+        cursor_pos_y(0),
+        cursor_enabled(false) {
+    }
+  };
+
+  static std::map<std::string, std::unique_ptr<CaptureState>> capture_states;
+
+  // Persistent EVDI device pool. Each EVDI device, once handed to
+  // cosmic-comp as a DRM output, is held by the compositor for its entire
+  // lifetime. If we allocate a fresh slot per stream, /dev/dri fills up
+  // until libevdi's 16-slot limit is hit. Instead we keep one open EVDI
+  // handle around between sessions and reconnect with a new EDID on each
+  // new stream — cosmic-comp sees that as a monitor hotplug, the same
+  // Wayland output morphs to the new resolution, no extra device required.
+  // Shared EVDI device model: only ONE physical EVDI device exists at
+  // a time, regardless of how many clients are streaming concurrently.
+  // The FIRST session to connect decides the resolution / refresh rate
+  // (via EDID); subsequent sessions become viewers of the same device
+  // and stream at whatever the first session set up. When ALL sessions
+  // disconnect, the device is fully torn down so the next "first"
+  // session can pick a fresh resolution.
+  //
+  // shared_evdi.refcount tracks the number of active VirtualDisplayInfo
+  // entries pointing at this device. Each VirtualDisplayInfo still
+  // owns its own capture buffer (multiple evdi_register_buffer calls
+  // with different buffer IDs on the same handle), so the sessions
+  // can encode independently without sharing pixel data.
+  struct SharedEvdiState {
+    int device_index {-1};
+    evdi_handle handle {nullptr};
+    int drm_fd {-1};
+    int refcount {0};
+  };
+  static SharedEvdiState shared_evdi;
+
   // ============================================================================
   // EVDI Library Loading
   // ============================================================================
@@ -276,6 +362,8 @@ namespace VDISPLAY {
     LOAD_EVDI_FUNC(handle_events);
     LOAD_EVDI_FUNC(get_event_ready);
     LOAD_EVDI_FUNC(get_lib_version);
+    // Optional — only present in libevdi >= 1.5; tolerate missing.
+    evdi.enable_cursor_events = (fn_evdi_enable_cursor_events) dlsym(evdi.lib_handle, "evdi_enable_cursor_events");
 
     #undef LOAD_EVDI_FUNC
 
@@ -333,21 +421,47 @@ namespace VDISPLAY {
     return "VIRTUAL-" + guid.string().substr(0, 8);
   }
 
-  static int find_available_evdi_device() {
-    // Find next available EVDI device
+  static int find_available_evdi_device(int exclude_slot = -1) {
+    // Find next available EVDI device, skipping `exclude_slot` if asked.
+    // The exclude is for the resolution-change recreate path: cosmic-comp
+    // keeps an fd open to the slot we just closed, so the kernel still
+    // reports it as EVDI_AVAILABLE (apollo's fd is gone), but cosmic-comp's
+    // cached DRM connector state for that slot would carry over. Forcing
+    // a different slot gives cosmic-comp a fresh hotplug for the new EDID.
+
+    // First pass: any existing EVDI_AVAILABLE slot?
     for (int i = 0; i < 16; i++) {
-      auto status = evdi.check_device(i);
-      if (status == EVDI_AVAILABLE) {
+      if (i == exclude_slot) continue;
+      if (evdi.check_device(i) == EVDI_AVAILABLE) {
         return i;
-      } else if (status == EVDI_NOT_PRESENT) {
-        // Device doesn't exist yet, we can add it
-        int result = evdi.add_device();
-        if (result >= 0) {
-          BOOST_LOG(info) << "[VDISPLAY] Added new EVDI device: " << result;
-          return result;
-        }
       }
     }
+
+    // None available — ask the EVDI module to add one. libevdi's
+    // evdi_add_device() writes 1 to /sys/devices/evdi/add; the kernel
+    // then picks the next free DRM minor, which after a previous
+    // remove_all can be 6, 7, 8, …, not the next sequential slot
+    // number. So after the sysfs write we have to scan ALL slots to
+    // find the newly-created one — checking the same slot index in a
+    // tight loop (the previous implementation) misses devices that
+    // landed at a higher index and burns a full second per missed slot.
+    int result = evdi.add_device();
+    if (result <= 0) {
+      BOOST_LOG(warning) << "[VDISPLAY] evdi_add_device returned " << result;
+      return -1;
+    }
+    for (int retry = 0; retry < 40; retry++) {  // up to 2 seconds
+      for (int i = 0; i < 16; i++) {
+        if (i == exclude_slot) continue;
+        if (evdi.check_device(i) == EVDI_AVAILABLE) {
+          BOOST_LOG(info) << "[VDISPLAY] Added new EVDI device at slot " << i;
+          return i;
+        }
+      }
+      std::this_thread::sleep_for(50ms);
+    }
+    BOOST_LOG(warning) << "[VDISPLAY] add_device succeeded but no slot became "
+                         "EVDI_AVAILABLE within 2s";
     return -1;
   }
 
@@ -609,6 +723,25 @@ namespace VDISPLAY {
 
     if (evdi_available) {
       BOOST_LOG(info) << "[VDISPLAY] EVDI available - real virtual displays supported!";
+
+      // Wipe any leftover EVDI slots from previous apollo runs (and from
+      // resolution-change recreates within this run that haven't been
+      // cleaned). cosmic-comp keeps fds open to all the EVDI slots it
+      // ever saw, so without this they'd accumulate up to the kernel's
+      // 16-slot limit before exhausting. At startup apollo isn't
+      // streaming and cosmic-comp's render scheduler isn't actively
+      // flipping to any EVDI plane, so the remove_all is safe — the
+      // freeze-during-stream case the closeVDisplayDevice comment warns
+      // about doesn't apply here.
+      if (FILE *f = std::fopen("/sys/devices/evdi/remove_all", "w")) {
+        std::fputc('1', f);
+        std::fclose(f);
+        BOOST_LOG(info) << "[VDISPLAY] Cleared leftover EVDI slots via remove_all";
+      } else {
+        BOOST_LOG(warning) << "[VDISPLAY] Couldn't write /sys/devices/evdi/remove_all "
+                              "(udev rules / video group permissions?) — EVDI slot "
+                              "accumulation may eventually exhaust the 16-slot limit";
+      }
     } else {
       BOOST_LOG(warning) << "[VDISPLAY] EVDI not available - using passthrough mode.";
       BOOST_LOG(warning) << "[VDISPLAY] The stream will capture the physical display.";
@@ -631,25 +764,41 @@ namespace VDISPLAY {
       watchdog_thread.join();
     }
 
-    // Clean up all virtual displays
-    for (auto &[guid, vdinfo] : virtual_displays) {
-      if (vdinfo.active) {
-        if (vdinfo.using_evdi && vdinfo.handle) {
-          evdi.disconnect(vdinfo.handle);
-          evdi.close(vdinfo.handle);
-        }
-        if (vdinfo.drm_fd >= 0) {
-          ::close(vdinfo.drm_fd);
-        }
-      }
-    }
     virtual_displays.clear();
+    capture_states.clear();
+
+    // Tear down the shared EVDI device, if it's still open.
+    if (shared_evdi.handle) {
+      if (evdi.disconnect) evdi.disconnect(shared_evdi.handle);
+      if (evdi.close) evdi.close(shared_evdi.handle);
+    }
+    if (shared_evdi.drm_fd >= 0) {
+      ::close(shared_evdi.drm_fd);
+    }
+    shared_evdi = {-1, nullptr, -1, 0};
 
     // Unload EVDI library
     unload_evdi_library();
 
     driver_status = DRIVER_STATUS::UNKNOWN;
     BOOST_LOG(info) << "[VDISPLAY] Linux virtual display driver closed.";
+  }
+
+  int disconnectAllEvdiMonitors() {
+    std::lock_guard<std::mutex> lock(vdisplay_mutex);
+    int count = 0;
+    for (auto &[guid, vdinfo] : virtual_displays) {
+      if (vdinfo.active && vdinfo.using_evdi && vdinfo.handle && evdi.disconnect) {
+        evdi.disconnect(vdinfo.handle);
+        count++;
+      }
+    }
+    // Intentionally NOT clearing virtual_displays / capture_states /
+    // persistent_evdi here — apollo's normal session teardown
+    // (removeVirtualDisplay) will tidy up its own state. This helper is
+    // only responsible for forcing cosmic-comp to see the monitor hot-
+    // unplug so the upcoming kdl apply doesn't fight the EVDI plane.
+    return count;
   }
 
   bool startPingThread(std::function<void()> failCb) {
@@ -745,35 +894,63 @@ namespace VDISPLAY {
     vdinfo.using_evdi = false;
 
     if (evdi_available) {
-      // Create real virtual display using EVDI
-      int device = find_available_evdi_device();
-      if (device >= 0) {
-        evdi_handle handle = evdi.open(device);
-        if (handle) {
-          // Generate EDID for requested resolution
-          unsigned char *edid = generate_edid_for_resolution(width, height, fps_hz);
-
-          // Determine EDID size (128 for base, 256 with extension for 4K)
-          unsigned int edid_size = (width > 1920 || height > 1080) ? 256 : 128;
-
-          // Connect with EDID (no area limit)
-          BOOST_LOG(info) << "[VDISPLAY] Connecting with " << edid_size << "-byte EDID for " << width << "x" << height;
-          evdi.connect(handle, edid, edid_size, 0);
-
-          vdinfo.device_index = device;
-          vdinfo.handle = handle;
-          vdinfo.using_evdi = true;
-
-          // Find the DRM card for this EVDI device
-          std::string card_path = "/dev/dri/card" + std::to_string(device);
-          vdinfo.drm_fd = ::open(card_path.c_str(), O_RDWR);
-
-          BOOST_LOG(info) << "[VDISPLAY] Created EVDI virtual display on device " << device;
+      if (shared_evdi.handle == nullptr) {
+        // First-ever stream session. Open a kernel-side EVDI device
+        // and connect an EDID for this client's requested resolution.
+        int device = find_available_evdi_device();
+        evdi_handle handle = nullptr;
+        if (device >= 0) {
+          handle = evdi.open(device);
+          if (handle) {
+            BOOST_LOG(info) << "[VDISPLAY] Allocated EVDI device at slot " << device;
+          } else {
+            BOOST_LOG(warning) << "[VDISPLAY] Failed to open EVDI device " << device;
+          }
         } else {
-          BOOST_LOG(warning) << "[VDISPLAY] Failed to open EVDI device " << device;
+          BOOST_LOG(warning) << "[VDISPLAY] No available EVDI device, using passthrough.";
         }
+        if (handle) {
+          unsigned char *edid = generate_edid_for_resolution(width, height, fps_hz);
+          unsigned int edid_size = (width > 1920 || height > 1080) ? 256 : 128;
+          BOOST_LOG(info) << "[VDISPLAY] Connecting EDID " << width << "x" << height;
+          evdi.connect(handle, edid, edid_size, 0);
+          std::string card_path = "/dev/dri/card" + std::to_string(device);
+          shared_evdi.device_index = device;
+          shared_evdi.handle = handle;
+          shared_evdi.drm_fd = ::open(card_path.c_str(), O_RDONLY | O_CLOEXEC);
+          shared_evdi.refcount = 1;
+        }
+      } else if (shared_evdi.refcount == 0) {
+        // Existing EVDI device is between streams (no active sessions).
+        // The previous client's EDID is disconnected (we did that on
+        // last-session-end). Reconnect with this client's EDID — this
+        // is the "first session after all clients disconnected" path
+        // and DOES update the resolution to match this client. The
+        // 200ms sleep gives cosmic-comp time to process the prior
+        // unplug before the new plug arrives.
+        evdi.disconnect(shared_evdi.handle);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        unsigned char *edid = generate_edid_for_resolution(width, height, fps_hz);
+        unsigned int edid_size = (width > 1920 || height > 1080) ? 256 : 128;
+        BOOST_LOG(info) << "[VDISPLAY] Reconnecting EDID " << width << "x" << height
+                        << " (new first session)";
+        evdi.connect(shared_evdi.handle, edid, edid_size, 0);
+        shared_evdi.refcount = 1;
       } else {
-        BOOST_LOG(warning) << "[VDISPLAY] No available EVDI device, using passthrough.";
+        // Another client is already streaming. Join as a viewer at
+        // the existing resolution — no EDID change.
+        shared_evdi.refcount++;
+        BOOST_LOG(info) << "[VDISPLAY] Joining existing EVDI as viewer "
+                        << "(refcount " << shared_evdi.refcount
+                        << "); client's " << width << "x" << height
+                        << " ignored, stream stays at the first session's mode";
+      }
+
+      if (shared_evdi.handle) {
+        vdinfo.device_index = shared_evdi.device_index;
+        vdinfo.handle = shared_evdi.handle;
+        vdinfo.drm_fd = shared_evdi.drm_fd;
+        vdinfo.using_evdi = true;
       }
     }
 
@@ -805,16 +982,38 @@ namespace VDISPLAY {
     auto &vdinfo = it->second;
     BOOST_LOG(info) << "[VDISPLAY] Removing virtual display: " << vdinfo.name;
 
-    if (vdinfo.using_evdi && vdinfo.handle) {
-      evdi.disconnect(vdinfo.handle);
-      evdi.close(vdinfo.handle);
-    }
-
-    if (vdinfo.drm_fd >= 0) {
-      ::close(vdinfo.drm_fd);
+    // Free the per-session capture state first (registered buffer etc.).
+    auto cs_it = capture_states.find(guid_str);
+    if (cs_it != capture_states.end()) {
+      if (vdinfo.handle && evdi.unregister_buffer) {
+        evdi.unregister_buffer(vdinfo.handle, cs_it->second->buffer_id);
+      }
+      capture_states.erase(cs_it);
     }
 
     virtual_displays.erase(it);
+
+    // Shared-EVDI bookkeeping. Decrement refcount; when it hits 0 we
+    // ONLY disconnect the EDID (cosmic-comp drops it from its layout)
+    // but keep the underlying kernel device + handle + drm_fd alive
+    // for apollo's lifetime. Closing the handle here would race with
+    // the still-exiting videoThread inside captureFrame — evdi.close
+    // blocks waiting for the in-flight ioctl to settle, and that
+    // burns through apollo's session::join 10-second hang detect →
+    // SIGABRT → forced restart. The handle gets closed properly at
+    // apollo shutdown via closeVDisplayDevice.
+    if (vdinfo.using_evdi && vdinfo.handle == shared_evdi.handle) {
+      shared_evdi.refcount--;
+      BOOST_LOG(info) << "[VDISPLAY] Shared EVDI refcount now " << shared_evdi.refcount;
+      if (shared_evdi.refcount <= 0) {
+        shared_evdi.refcount = 0;
+        if (shared_evdi.handle && evdi.disconnect) {
+          BOOST_LOG(info) << "[VDISPLAY] All sessions ended — disconnecting EDID "
+                             "(keeping device open for next session)";
+          evdi.disconnect(shared_evdi.handle);
+        }
+      }
+    }
 
     BOOST_LOG(info) << "[VDISPLAY] Virtual display removed successfully.";
     return true;
@@ -956,6 +1155,423 @@ namespace VDISPLAY {
       }
     }
     return -1;
+  }
+
+  std::string firstActiveEvdiName() {
+    std::lock_guard<std::mutex> lock(vdisplay_mutex);
+    for (const auto &[guid, vdinfo] : virtual_displays) {
+      if (vdinfo.active && vdinfo.using_evdi) {
+        return vdinfo.name;
+      }
+    }
+    return {};
+  }
+
+  // ==========================================================================
+  // EVDI frame consumer implementation
+  // ==========================================================================
+
+  namespace {
+    // Lookup helper: returns the GUID string of the named virtual display, or
+    // an empty string if not found / not EVDI-backed. Caller must already hold
+    // vdisplay_mutex.
+    std::string find_guid_by_name_locked(const std::string &displayName) {
+      for (const auto &[guid, vdinfo] : virtual_displays) {
+        if (vdinfo.name == displayName && vdinfo.using_evdi) {
+          return guid;
+        }
+      }
+      return {};
+    }
+
+    // EVDI update_ready callback. Fires when the kernel has copied a new frame
+    // into our registered buffer. user_data is the CaptureState* for the
+    // associated virtual display.
+    void on_update_ready(int /*buffer_id*/, void *user_data) {
+      auto *state = static_cast<CaptureState *>(user_data);
+      if (state) {
+        state->update_ready.store(true, std::memory_order_release);
+      }
+    }
+
+    void on_mode_changed(struct evdi_mode mode, void *user_data) {
+      // cosmic-comp set a new mode on the EVDI head. Until this fires after
+      // a fresh evdi.connect, the kernel rejects grab_pixels with EINVAL
+      // ("Invalid argument") and the buffer stays zeroed — which is what
+      // showed up on the client as a black screen on every reconnect.
+      auto *state = static_cast<CaptureState *>(user_data);
+      if (state) {
+        state->mode_width.store(mode.width, std::memory_order_release);
+        state->mode_height.store(mode.height, std::memory_order_release);
+        state->mode_ready.store(true, std::memory_order_release);
+      }
+    }
+
+    void on_dpms(int /*dpms_mode*/, void * /*user_data*/) {
+    }
+
+    void on_crtc_state(int /*state*/, void * /*user_data*/) {
+    }
+
+    // cosmic-comp renders the cursor on a hardware cursor plane that's
+    // separate from the primary framebuffer, so grab_pixels never sees it.
+    // EVDI exposes the cursor pixels + position via these two callbacks.
+    void on_cursor_set(struct evdi_cursor_set cursor_set, void *user_data) {
+      auto *state = static_cast<CaptureState *>(user_data);
+      if (!state) return;
+      std::lock_guard<std::mutex> lock(state->cursor_mutex);
+      if (!cursor_set.enabled || cursor_set.buffer == nullptr ||
+          cursor_set.width == 0 || cursor_set.height == 0) {
+        state->cursor_enabled.store(false, std::memory_order_release);
+        return;
+      }
+      state->cursor_width = static_cast<int>(cursor_set.width);
+      state->cursor_height = static_cast<int>(cursor_set.height);
+      state->cursor_hot_x = cursor_set.hot_x;
+      state->cursor_hot_y = cursor_set.hot_y;
+      size_t bytes = static_cast<size_t>(cursor_set.width) * cursor_set.height * 4;
+      state->cursor_pixels.assign(bytes, 0);
+      std::memcpy(state->cursor_pixels.data(), cursor_set.buffer, bytes);
+      state->cursor_enabled.store(true, std::memory_order_release);
+    }
+
+    void on_cursor_move(struct evdi_cursor_move cursor_move, void *user_data) {
+      auto *state = static_cast<CaptureState *>(user_data);
+      if (!state) return;
+      state->cursor_pos_x.store(cursor_move.x, std::memory_order_release);
+      state->cursor_pos_y.store(cursor_move.y, std::memory_order_release);
+    }
+  }  // namespace
+
+  bool registerCaptureBuffer(const std::string &displayName) {
+    std::lock_guard<std::mutex> lock(vdisplay_mutex);
+
+    auto guid = find_guid_by_name_locked(displayName);
+    if (guid.empty()) {
+      BOOST_LOG(warning) << "[VDISPLAY] registerCaptureBuffer: display "
+                         << displayName << " not found or not EVDI";
+      return false;
+    }
+
+    auto &vdinfo = virtual_displays[guid];
+    if (!vdinfo.using_evdi || !vdinfo.handle) {
+      BOOST_LOG(warning) << "[VDISPLAY] registerCaptureBuffer: no EVDI handle for "
+                         << displayName;
+      return false;
+    }
+
+    if (capture_states.count(guid)) {
+      // Already registered. Treat as success — caller may have been retrying.
+      return true;
+    }
+
+    auto state = std::make_unique<CaptureState>();
+    state->width = static_cast<int>(vdinfo.width);
+    state->height = static_cast<int>(vdinfo.height);
+    state->stride = state->width * 4;  // BGRX/BGRA, 4 bytes per pixel
+    state->buffer.assign(static_cast<size_t>(state->stride) * state->height, 0);
+    state->dirty_rects.assign(16, evdi_rect {0, 0, 0, 0});
+    state->buffer_id = 1;
+    state->update_ready.store(false, std::memory_order_release);
+    // Assume the mode is already settled on the EVDI device. evdi.connect()
+    // fires mode_changed once per cosmic-comp hotplug, but Apollo creates
+    // multiple display_t / CaptureState instances per stream session (one
+    // per encoder probe iteration) without a fresh connect — so the event
+    // never re-fires for the 2nd+ buffer registration, captureFrame would
+    // wait forever, and width/height collapse to 0 in the probe result,
+    // producing swscaler srcw=0 errors and black frames on the client.
+    // Marking mode_ready true is safe: if the mode actually isn't settled,
+    // grab_pixels returns EINVAL and the watchdog/retry handles it.
+    state->mode_ready.store(true, std::memory_order_release);
+    state->mode_width.store(state->width, std::memory_order_release);
+    state->mode_height.store(state->height, std::memory_order_release);
+
+    evdi_buffer ebuf {};
+    ebuf.id = state->buffer_id;
+    ebuf.buffer = state->buffer.data();
+    ebuf.width = state->width;
+    ebuf.height = state->height;
+    ebuf.stride = state->stride;
+    ebuf.rects = state->dirty_rects.data();
+    ebuf.rect_count = static_cast<int>(state->dirty_rects.size());
+
+    evdi.register_buffer(vdinfo.handle, ebuf);
+
+    // Ask EVDI to deliver cursor events so we can composite the cursor onto
+    // the captured framebuffer. cosmic-comp paints the cursor on a separate
+    // hardware plane that grab_pixels never sees; without this the stream
+    // shows the desktop but no pointer.
+    if (evdi.enable_cursor_events) {
+      evdi.enable_cursor_events(vdinfo.handle, true);
+    }
+
+    BOOST_LOG(info) << "[VDISPLAY] Registered capture buffer for " << displayName
+                    << " (" << state->width << "x" << state->height
+                    << ", " << state->buffer.size() << " bytes)";
+
+    capture_states.emplace(guid, std::move(state));
+    return true;
+  }
+
+  void blendCursor(const std::string &displayName,
+                    uint8_t *dst,
+                    int dst_width,
+                    int dst_height,
+                    int dst_stride) {
+    if (!dst || dst_width <= 0 || dst_height <= 0) return;
+
+    CaptureState *state = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(vdisplay_mutex);
+      auto guid = find_guid_by_name_locked(displayName);
+      if (guid.empty()) return;
+      auto cs_it = capture_states.find(guid);
+      if (cs_it == capture_states.end()) return;
+      state = cs_it->second.get();
+    }
+
+    if (!state->cursor_enabled.load(std::memory_order_acquire)) return;
+
+    std::lock_guard<std::mutex> cursor_lock(state->cursor_mutex);
+    if (state->cursor_pixels.empty() ||
+        state->cursor_width <= 0 ||
+        state->cursor_height <= 0) {
+      return;
+    }
+
+    int cursor_x = state->cursor_pos_x.load(std::memory_order_acquire) - state->cursor_hot_x;
+    int cursor_y = state->cursor_pos_y.load(std::memory_order_acquire) - state->cursor_hot_y;
+
+    const uint8_t *cursor = state->cursor_pixels.data();
+    const int cw = state->cursor_width;
+    const int ch = state->cursor_height;
+
+    // EVDI cursor pixels are in the same byte order as the framebuffer
+    // (BGRA after our R/B swap on copy). The cursor buffer is pre-multiplied
+    // alpha; standard "over" blend.
+    for (int row = 0; row < ch; ++row) {
+      int dy = cursor_y + row;
+      if (dy < 0 || dy >= dst_height) continue;
+      for (int col = 0; col < cw; ++col) {
+        int dx = cursor_x + col;
+        if (dx < 0 || dx >= dst_width) continue;
+
+        const uint8_t *src_px = cursor + (row * cw + col) * 4;
+        uint8_t *dst_px = dst + dy * dst_stride + dx * 4;
+        uint8_t a = src_px[3];
+        if (a == 0) continue;
+        // EVDI cursor is RGBA in memory; we want BGRA. Swap R<->B as we blend.
+        uint8_t sr = src_px[0];
+        uint8_t sg = src_px[1];
+        uint8_t sb = src_px[2];
+        if (a == 255) {
+          dst_px[0] = sb;
+          dst_px[1] = sg;
+          dst_px[2] = sr;
+        } else {
+          // Standard over blend: dst = src + dst * (1 - src_alpha).
+          // src is already premultiplied per EVDI cursor convention.
+          uint16_t inv_a = 255 - a;
+          dst_px[0] = static_cast<uint8_t>(sb + (dst_px[0] * inv_a) / 255);
+          dst_px[1] = static_cast<uint8_t>(sg + (dst_px[1] * inv_a) / 255);
+          dst_px[2] = static_cast<uint8_t>(sr + (dst_px[2] * inv_a) / 255);
+        }
+      }
+    }
+  }
+
+  void resetModeReady(const std::string &displayName) {
+    std::lock_guard<std::mutex> lock(vdisplay_mutex);
+    auto guid = find_guid_by_name_locked(displayName);
+    if (guid.empty()) return;
+    auto cs_it = capture_states.find(guid);
+    if (cs_it == capture_states.end()) return;
+    cs_it->second->mode_ready.store(false, std::memory_order_release);
+    cs_it->second->update_ready.store(false, std::memory_order_release);
+  }
+
+  void unregisterCaptureBuffer(const std::string &displayName) {
+    std::lock_guard<std::mutex> lock(vdisplay_mutex);
+
+    auto guid = find_guid_by_name_locked(displayName);
+    if (guid.empty()) {
+      return;
+    }
+
+    auto cs_it = capture_states.find(guid);
+    if (cs_it == capture_states.end()) {
+      return;
+    }
+
+    auto &vdinfo = virtual_displays[guid];
+    if (vdinfo.handle && evdi.unregister_buffer) {
+      evdi.unregister_buffer(vdinfo.handle, cs_it->second->buffer_id);
+    }
+    capture_states.erase(cs_it);
+
+    BOOST_LOG(info) << "[VDISPLAY] Unregistered capture buffer for " << displayName;
+  }
+
+  int captureFrame(const std::string &displayName, CapturedFrame *frame, int timeout_ms) {
+    if (!frame) {
+      return -1;
+    }
+
+    // Take the EVDI handle and capture state without holding vdisplay_mutex
+    // across the blocking poll() — the watchdog and frame loop must not
+    // deadlock against teardown.
+    evdi_handle handle = nullptr;
+    CaptureState *state = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(vdisplay_mutex);
+      auto guid = find_guid_by_name_locked(displayName);
+      if (guid.empty()) {
+        return -1;
+      }
+      auto cs_it = capture_states.find(guid);
+      if (cs_it == capture_states.end()) {
+        return -1;
+      }
+      auto &vdinfo = virtual_displays[guid];
+      if (!vdinfo.handle) {
+        return -1;
+      }
+      handle = vdinfo.handle;
+      state = cs_it->second.get();
+    }
+
+    std::lock_guard<std::mutex> grab_lock(state->grab_mutex);
+
+    // If we haven't seen a mode_changed event yet after the last evdi.connect,
+    // the kernel will reject grab_pixels with EINVAL. Drain the event queue
+    // first (handle_events fires on_mode_changed → flips mode_ready).
+    if (!state->mode_ready.load(std::memory_order_acquire)) {
+      int fd = evdi.get_event_ready(handle);
+      if (fd >= 0) {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+        while (!state->mode_ready.load(std::memory_order_acquire)) {
+          auto now = std::chrono::steady_clock::now();
+          if (now >= deadline) {
+            return 1;  // timeout — capture loop will retry
+          }
+          int remaining_ms = static_cast<int>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+          struct pollfd pfd {};
+          pfd.fd = fd;
+          pfd.events = POLLIN;
+          int rc = poll(&pfd, 1, remaining_ms);
+          if (rc < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+          }
+          if (rc == 0) return 1;
+
+          evdi_event_context ctx {};
+          ctx.dpms_handler = on_dpms;
+          ctx.mode_changed_handler = on_mode_changed;
+          ctx.update_ready_handler = on_update_ready;
+          ctx.crtc_state_handler = on_crtc_state;
+          ctx.cursor_set_handler = on_cursor_set;
+          ctx.cursor_move_handler = on_cursor_move;
+          ctx.user_data = state;
+          evdi.handle_events(handle, &ctx);
+        }
+        // Mode is now known. If it differs from what we registered the
+        // buffer for, re-register at the new dimensions.
+        int new_w = state->mode_width.load(std::memory_order_acquire);
+        int new_h = state->mode_height.load(std::memory_order_acquire);
+        if (new_w > 0 && new_h > 0 && (new_w != state->width || new_h != state->height)) {
+          BOOST_LOG(info) << "[VDISPLAY] Mode changed to " << new_w << "x" << new_h
+                          << " (was " << state->width << "x" << state->height
+                          << "), re-registering buffer";
+          if (evdi.unregister_buffer) {
+            evdi.unregister_buffer(handle, state->buffer_id);
+          }
+          state->width = new_w;
+          state->height = new_h;
+          state->stride = new_w * 4;
+          state->buffer.assign(static_cast<size_t>(state->stride) * state->height, 0);
+          evdi_buffer ebuf {};
+          ebuf.id = state->buffer_id;
+          ebuf.buffer = state->buffer.data();
+          ebuf.width = state->width;
+          ebuf.height = state->height;
+          ebuf.stride = state->stride;
+          ebuf.rects = state->dirty_rects.data();
+          ebuf.rect_count = static_cast<int>(state->dirty_rects.size());
+          evdi.register_buffer(handle, ebuf);
+        }
+      }
+    }
+
+    // request_update can return true (buffer already updated synchronously) or
+    // false (async — wait for update_ready_handler).
+    state->update_ready.store(false, std::memory_order_release);
+
+    bool ready = evdi.request_update(handle, state->buffer_id);
+    if (!ready) {
+      // Block on the EVDI event fd until either the update arrives or we time out.
+      // evdi_selectable is typedef'd to int in upstream libevdi headers.
+      int fd = evdi.get_event_ready(handle);
+      if (fd < 0) {
+        return -1;
+      }
+
+      auto deadline = std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(timeout_ms);
+
+      while (!state->update_ready.load(std::memory_order_acquire)) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+          return 1;  // timeout
+        }
+        int remaining_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+
+        struct pollfd pfd {};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        int rc = poll(&pfd, 1, remaining_ms);
+        if (rc < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          return -1;
+        }
+        if (rc == 0) {
+          return 1;
+        }
+        // Drain events; this may invoke on_update_ready -> sets update_ready=true.
+        evdi_event_context ctx {};
+        ctx.dpms_handler = on_dpms;
+        ctx.mode_changed_handler = on_mode_changed;
+        ctx.update_ready_handler = on_update_ready;
+        ctx.crtc_state_handler = on_crtc_state;
+        ctx.cursor_set_handler = on_cursor_set;
+        ctx.cursor_move_handler = on_cursor_move;
+        ctx.ddcci_data_handler = nullptr;
+        ctx.user_data = state;
+        evdi.handle_events(handle, &ctx);
+      }
+    }
+
+    // Tell libevdi to fill in dirty rects and update the buffer mapping.
+    int num_rects = static_cast<int>(state->dirty_rects.size());
+    evdi.grab_pixels(handle, state->dirty_rects.data(), &num_rects);
+
+    timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    frame->data = state->buffer.data();
+    frame->width = state->width;
+    frame->height = state->height;
+    frame->stride = state->stride;
+    frame->timestamp_ns = static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ull +
+                          static_cast<uint64_t>(ts.tv_nsec);
+    frame->dirty_rect_count = num_rects;
+
+    return 0;
   }
 
 }  // namespace VDISPLAY

@@ -609,6 +609,21 @@ namespace platf {
             continue;
           }
 
+          // Skip EVDI cards (see matching comment in kms_display_names).
+          {
+            auto driver_link = "/sys/class/drm/" + filestring + "/device/driver";
+            char drvname[64] = {};
+            ssize_t n = ::readlink(driver_link.c_str(), drvname, sizeof(drvname) - 1);
+            if (n > 0) {
+              drvname[n] = '\0';
+              const char *basename = std::strrchr(drvname, '/');
+              basename = basename ? basename + 1 : drvname;
+              if (std::strcmp(basename, "evdi") == 0) {
+                continue;
+              }
+            }
+          }
+
           kms::card_t card;
           if (card.init(entry.path().c_str())) {
             continue;
@@ -1602,6 +1617,27 @@ namespace platf {
       auto filestring = file.generic_string();
       if (std::string_view {filestring}.substr(0, 4) != "card"sv) {
         continue;
+      }
+
+      // Skip EVDI cards — those are owned by our evdi_grab backend and
+      // routed via VDISPLAY::isEvdiDisplay() in the display() dispatch.
+      // If KMS picks them here, the encoder probe tries to use a render-
+      // less DRM device and fails the whole probe with "Couldn't find
+      // monitor [0]".
+      {
+        auto driver_link = "/sys/class/drm/" + filestring + "/device/driver";
+        char drvname[64] = {};
+        ssize_t n = ::readlink(driver_link.c_str(), drvname, sizeof(drvname) - 1);
+        if (n > 0) {
+          drvname[n] = '\0';
+          const char *basename = std::strrchr(drvname, '/');
+          basename = basename ? basename + 1 : drvname;
+          if (std::strcmp(basename, "evdi") == 0) {
+            BOOST_LOG(debug) << "Skipping EVDI card " << filestring
+                              << " in kms_display_names (handled by evdi_grab)";
+            continue;
+          }
+        }
       }
 
       kms::card_t card;

@@ -1944,6 +1944,10 @@ namespace stream {
   namespace session {
     std::atomic_uint running_sessions;
 
+    unsigned int active_session_count() {
+      return running_sessions.load(std::memory_order_acquire);
+    }
+
     state_e state(session_t &session) {
       return session.state.load(std::memory_order_relaxed);
     }

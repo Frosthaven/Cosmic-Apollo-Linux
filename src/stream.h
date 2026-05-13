@@ -56,5 +56,19 @@ namespace stream {
     void join(session_t &session);
     state_e state(session_t &session);
     inline bool send(session_t& session, const std::string_view &payload);
+
+    /**
+     * @brief Lock-free read of the running_sessions atomic counter.
+     *        Safe to call from videoThread / OutputRestoreGuard while
+     *        rtsp_server_t::clear() holds _session_slots.lock(), where
+     *        rtsp_stream::session_count() would deadlock because it
+     *        internally tries to reacquire the same lock.
+     *        Counter is incremented at session::start, decremented at
+     *        the end of session::join (after videoThread.join()), so
+     *        during the destructor's run our own session is still
+     *        counted — `active_session_count() > 1` means "another
+     *        client is still streaming besides me".
+     */
+    unsigned int active_session_count();
   }  // namespace session
 }  // namespace stream

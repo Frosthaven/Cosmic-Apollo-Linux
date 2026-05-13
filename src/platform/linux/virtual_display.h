@@ -38,6 +38,18 @@ namespace VDISPLAY {
   void closeVDisplayDevice();
 
   /**
+   * @brief Force a hot-unplug of every currently-active EVDI monitor by
+   *        calling evdi.disconnect on each handle. Leaves the kernel-side
+   *        EVDI device(s) open so the next session can reuse them — only
+   *        the EDID is detached. Used by the disconnect-time restore path
+   *        to break the cosmic-comp render-scheduler hold on the EVDI
+   *        plane *before* issuing the kdl apply, so the apply doesn't
+   *        deadlock on backend.lock().
+   * @return Number of monitors disconnected.
+   */
+  int disconnectAllEvdiMonitors();
+
+  /**
    * @brief Start a ping thread to keep the virtual display alive.
    * @param failCb Callback to invoke if the watchdog fails.
    * @return true if the ping thread was started successfully, false otherwise.
@@ -141,10 +153,97 @@ namespace VDISPLAY {
   bool isEvdiDisplay(const std::string &displayName);
 
   /**
+   * @brief Return the name of any currently-active EVDI virtual display, or
+   *        an empty string if none exists. Used to route encoder-probe
+   *        calls (which pass an empty display_name) into the EVDI capture
+   *        backend instead of letting them fall through to KMS — KMS opens
+   *        the physical DRM cards and contends with cosmic-comp's page
+   *        flips, causing the user's monitors to go dark with EBUSY.
+   */
+  std::string firstActiveEvdiName();
+
+  /**
    * @brief Get the DRM card index for an EVDI display.
    * @param displayName The name of the EVDI display.
    * @return The card index, or -1 if not found or not an EVDI display.
    */
   int getEvdiCardIndex(const std::string &displayName);
+
+  // ==========================================================================
+  // EVDI frame consumer API
+  //
+  // After createVirtualDisplay() returns a name for an EVDI-backed display,
+  // a capture client should call registerCaptureBuffer() once and then
+  // captureFrame() in a loop. captureFrame blocks until either a new frame is
+  // ready (kernel copies the rendered framebuffer into the registered buffer)
+  // or the timeout expires.
+  //
+  // Without these calls, cosmic-comp's page flips on the EVDI card stall in
+  // the kernel waiting for a consumer and fail with EBUSY, which is the
+  // failure mode the upstream MrOz59 fork ships with.
+  // ==========================================================================
+
+  /**
+   * @brief Allocate a capture buffer for the named virtual display and
+   *        register it with the EVDI kernel module. Must be called exactly
+   *        once per virtual display, after createVirtualDisplay().
+   * @param displayName The name returned by createVirtualDisplay().
+   * @return true on success.
+   */
+  bool registerCaptureBuffer(const std::string &displayName);
+
+  /**
+   * @brief Unregister and free the capture buffer. Called automatically on
+   *        removeVirtualDisplay() but exposed for explicit teardown.
+   * @param displayName The name of the virtual display.
+   */
+  void unregisterCaptureBuffer(const std::string &displayName);
+
+  struct CapturedFrame {
+    const uint8_t *data;  ///< BGRX/BGRA pixel data, owned by VDISPLAY
+    int width;
+    int height;
+    int stride;
+    uint64_t timestamp_ns;  ///< CLOCK_MONOTONIC timestamp at frame ready
+    int dirty_rect_count;
+  };
+
+  /**
+   * @brief Request a frame update from EVDI and block until it is ready.
+   * @param displayName The name of the virtual display.
+   * @param frame Output: populated with the latest framebuffer pointer.
+   * @param timeout_ms Maximum time to wait for the next frame.
+   * @retval 0 frame populated with new contents
+   * @retval 1 timeout (no new frame arrived in time)
+   * @retval -1 error (display gone, EVDI failure, etc.)
+   */
+  int captureFrame(const std::string &displayName, CapturedFrame *frame, int timeout_ms);
+
+  /**
+   * @brief Reset the capture state so the next captureFrame call blocks
+   *        until a fresh mode_changed event arrives. Call this immediately
+   *        before triggering a compositor-driven mode change (e.g.
+   *        cosmic-randr mode ...) so the consumer doesn't race the
+   *        kernel's mode-set IOCTL.
+   * @param displayName The name of the virtual display.
+   */
+  void resetModeReady(const std::string &displayName);
+
+  /**
+   * @brief Composite the latest cursor (as delivered by EVDI cursor_set /
+   *        cursor_move events) onto the given BGRA buffer. EVDI doesn't
+   *        bake the hardware cursor into the primary framebuffer, so the
+   *        capture backend must paint it manually after grab_pixels.
+   * @param displayName The name of the virtual display.
+   * @param dst        Target BGRA buffer (must be width*height*4 bytes).
+   * @param dst_width  Width of the target buffer.
+   * @param dst_height Height of the target buffer.
+   * @param dst_stride Row stride in bytes (typically dst_width*4).
+   */
+  void blendCursor(const std::string &displayName,
+                    uint8_t *dst,
+                    int dst_width,
+                    int dst_height,
+                    int dst_stride);
 
 }  // namespace VDISPLAY

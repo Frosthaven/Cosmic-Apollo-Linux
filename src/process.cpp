@@ -83,6 +83,17 @@ namespace proc {
   public:
     ~deinit_t() {
       proc.terminate();
+      // Clean up the EVDI virtual display driver before main() returns and
+      // libc starts running static destructors. closeVDisplayDevice() joins
+      // the VDISPLAY watchdog thread; without this, the still-joinable
+      // std::thread sits as a global until exit() destructs it, at which
+      // point ~thread() calls std::terminate() → SIGABRT and the process
+      // core-dumps every shutdown. The core-dump also leaves cosmic-comp
+      // holding a half-cleaned-up EVDI output, which then blocks the next
+      // streaming session's captureFrame forever (cosmic-comp refuses to
+      // render to a broken-pipe output) — i.e. "connect with device A,
+      // disconnect, device B times out connecting."
+      VDISPLAY::closeVDisplayDevice();
     }
   };
 

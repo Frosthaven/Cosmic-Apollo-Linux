@@ -9,9 +9,8 @@ set(BOOST_COMPONENTS
         locale
         log
         program_options
-        system
 )
-# system is not used by Sunshine, but by Simple-Web-Server, added here for convenience
+# system is not used by Sunshine, but by Simple-Web-Server; in Boost 1.91+ it's header-only and merged into headers
 
 # algorithm, preprocessor, scope, and uuid are not used by Sunshine, but by libdisplaydevice, added here for convenience
 if(WIN32)
@@ -30,7 +29,7 @@ endif()
 if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.30")
     cmake_policy(SET CMP0167 NEW)  # Get BoostConfig.cmake from upstream
 endif()
-find_package(Boost CONFIG ${BOOST_VERSION} EXACT COMPONENTS ${BOOST_COMPONENTS})
+find_package(Boost CONFIG COMPONENTS ${BOOST_COMPONENTS})
 if(NOT Boost_FOUND)
     message(STATUS "Boost v${BOOST_VERSION} package not found in the system. Falling back to FetchContent.")
     include(FetchContent)

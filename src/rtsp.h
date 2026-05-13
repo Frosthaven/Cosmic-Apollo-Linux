@@ -92,6 +92,15 @@ namespace rtsp_stream {
   void terminate_sessions();
 
   /**
+   * @brief Terminates streaming sessions whose device_uuid matches the
+   *        provided uuid. Used by /cancel to end only the requesting
+   *        client's stream when other clients are sharing the same app
+   *        (multi-client Quit Session). Returns the number of sessions
+   *        that were terminated.
+   */
+  int terminate_sessions_by_uuid(const std::string_view &uuid);
+
+  /**
    * @brief Runs the RTSP server loop.
    */
   void start();

@@ -1482,13 +1482,58 @@ namespace nvhttp {
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
 
+    // Multi-client Quit Session: if other clients are still streaming,
+    // /cancel from one of them must only end THAT requester's stream.
+    // The global terminate_sessions() + proc.terminate() path would
+    // kick every other client AND run the app's prep-cmd undo (which
+    // for Steam Big Picture is a `pkill steam`), so a shared user
+    // hitting Quit Session today nukes everyone else's session.
+    //
+    // Match on named_cert_p->uuid because each session's device_uuid
+    // is set from launch_session->unique_id, which itself is set from
+    // the requesting cert's uuid in make_launch_session(). One client
+    // can have multiple sessions if they reconnect, hence the helper
+    // walks all slots rather than stopping at the first match.
+    //
+    // We skip proc.terminate() and display_device::revert_configuration()
+    // in this branch — the app and the physical-output reconfiguration
+    // are global state the surviving clients still depend on. They run
+    // normally on the LAST session's exit via the stream.cpp join path
+    // (proc.pause()) and the EVDI guard.
+    //
+    // Trade-off: the requesting client polls /serverinfo expecting
+    // currentgame == 0 to confirm Quit Session landed. With the app
+    // still up, that flip never happens and the client may hit a 599
+    // "daemon connection error" timeout. Their stream IS ended, so
+    // they get bounced back to the Moonlight lobby either way — the
+    // alternative (kicking everyone) is strictly worse.
+    const int active = rtsp_stream::session_count();
+    if (active > 1) {
+      const int killed = rtsp_stream::terminate_sessions_by_uuid(named_cert_p->uuid);
+      BOOST_LOG(info) << "Multi-client Quit Session from [" << named_cert_p->name
+                      << "]: ended " << killed << " of its session(s), kept "
+                      << (active - killed) << " other session(s) alive";
+      return;
+    }
+
     rtsp_stream::terminate_sessions();
 
+    // Single-client Quit Session: original behavior. Artemis (and
+    // Moonlight) poll /serverinfo expecting currentgame to flip to 0.
+    // If we leave the app alive after /cancel, the poll never sees
+    // that and the mobile client errors out at 599 (daemon connection
+    // error). proc.terminate() runs the app's prep-cmd undo
+    // asynchronously (via the sh -c '...&' wrapper in apps.json) so
+    // this call is fast — apollo's HTTPS response returns promptly
+    // even while Steam is shutting down in the background.
+    //
+    // "Disconnect" in Artemis does NOT send /cancel — it only closes
+    // the RTSP stream, which triggers stream.cpp::proc.pause(). The
+    // pause path keeps the app alive (placebo=true) so resume works.
     if (proc::proc.running() > 0) {
       proc::proc.terminate();
     }
 
-    // The config needs to be reverted regardless of whether "proc::proc.terminate()" was called or not.
     display_device::revert_configuration();
   }
 

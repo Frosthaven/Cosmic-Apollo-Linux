@@ -4,7 +4,10 @@
  */
 // standard includes
 #include <bitset>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
+#include <sys/stat.h>
 #include <thread>
 
 // lib includes
@@ -467,6 +470,36 @@ namespace platf {
       int set_sink(const std::string &sink) override {
         auto alarm = safe::make_alarm<int>();
 
+        // Crash safety net: if we're about to switch the default sink to
+        // one of apollo's virtual sinks, capture the user's *current*
+        // default sink to disk first. apollo's normal disconnect flow
+        // already restores the sink, but if apollo crashes / hangs /
+        // freezes during a stream the user is left with the virtual
+        // sink active and no audio. ~/.cache/apollo/original-audio-sink
+        // is read at startup by audio_startup_recovery() and restored.
+        if (sink.rfind("sink-sunshine-", 0) == 0) {
+          auto current = get_default_sink_name();
+          if (!current.empty() && current.rfind("sink-sunshine-", 0) != 0) {
+            const char *home = std::getenv("HOME");
+            if (home) {
+              std::string dir = std::string(home) + "/.cache/apollo";
+              ::mkdir(dir.c_str(), 0700);
+              std::string path = dir + "/original-audio-sink";
+              if (FILE *f = std::fopen(path.c_str(), "w")) {
+                std::fwrite(current.data(), 1, current.size(), f);
+                std::fclose(f);
+              }
+            }
+          }
+        } else {
+          // Switching to a non-virtual sink — apollo's normal restore
+          // path. Remove the recovery file since we no longer need it.
+          if (const char *home = std::getenv("HOME")) {
+            std::string path = std::string(home) + "/.cache/apollo/original-audio-sink";
+            std::remove(path.c_str());
+          }
+        }
+
         BOOST_LOG(info) << "Setting default sink to: ["sv << sink << "]"sv;
         op_t op {
           pa_context_set_default_sink(
@@ -521,5 +554,59 @@ namespace platf {
     }
 
     return audio;
+  }
+
+  // Called once at apollo startup from misc.cpp::init(). Companion to
+  // evdi_grab_startup_recovery(): if a prior session left a sink-sunshine-*
+  // sink as the user's default (because apollo crashed before its restore
+  // path could run), read ~/.cache/apollo/original-audio-sink and switch
+  // PulseAudio's default back to it. Uses pactl rather than spinning up a
+  // dedicated pa_context for a one-shot — pactl handles connect/auth and
+  // is universally available on PA/PipeWire systems.
+  void audio_startup_recovery() {
+    const char *home = std::getenv("HOME");
+    if (!home) return;
+    std::string path = std::string(home) + "/.cache/apollo/original-audio-sink";
+    FILE *f = std::fopen(path.c_str(), "r");
+    if (!f) return;
+    std::string sink;
+    char buf[256];
+    while (std::fgets(buf, sizeof(buf), f)) {
+      sink.append(buf);
+    }
+    std::fclose(f);
+    while (!sink.empty() && (sink.back() == '\n' || sink.back() == '\r' || sink.back() == ' ')) {
+      sink.pop_back();
+    }
+    if (sink.empty() || sink.rfind("sink-sunshine-", 0) == 0) {
+      // Empty or a virtual-sunshine name slipped in — nothing safe to
+      // restore. Drop the file so we don't keep retrying garbage.
+      std::remove(path.c_str());
+      return;
+    }
+    BOOST_LOG(info) << "[audio] startup recovery: restoring default sink to ["sv
+                    << sink << "]"sv;
+    // pactl handles its own escaping of the sink-name argument; quote
+    // defensively for shell.
+    std::string quoted;
+    quoted.reserve(sink.size() + 2);
+    quoted += '\'';
+    for (char c : sink) {
+      if (c == '\'') {
+        quoted += "'\\''";  // close, escaped quote, reopen
+      } else {
+        quoted += c;
+      }
+    }
+    quoted += '\'';
+    std::string cmd = "pactl set-default-sink " + quoted + " 2>/dev/null";
+    int rc = std::system(cmd.c_str());
+    if (rc == 0) {
+      std::remove(path.c_str());
+      BOOST_LOG(info) << "[audio] startup recovery complete"sv;
+    } else {
+      BOOST_LOG(warning) << "[audio] startup recovery failed (pactl rc="sv
+                         << rc << ") — state file kept for next start"sv;
+    }
   }
 }  // namespace platf

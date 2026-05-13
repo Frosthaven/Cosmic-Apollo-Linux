@@ -563,6 +563,31 @@ namespace rtsp_stream {
     }
 
     /**
+     * @brief Terminates only sessions whose device_uuid matches the
+     *        supplied uuid. The stop+join pattern mirrors clear(true)
+     *        so the videoThread shutdown path (including the EVDI
+     *        OutputRestoreGuard, which gates on session_count() > 1)
+     *        sees the still-living peers and skips the global cleanup.
+     * @return Number of sessions terminated.
+     */
+    int terminate_by_uuid(const std::string_view &uuid) {
+      auto lg = _session_slots.lock();
+      int killed = 0;
+      for (auto i = _session_slots->begin(); i != _session_slots->end();) {
+        auto &slot = *(*i);
+        if (stream::session::uuid_match(slot, uuid)) {
+          stream::session::stop(slot);
+          stream::session::join(slot);
+          i = _session_slots->erase(i);
+          killed++;
+        } else {
+          ++i;
+        }
+      }
+      return killed;
+    }
+
+    /**
      * @brief Removes the provided session from the set of sessions.
      * @param session The session to remove.
      */
@@ -667,6 +692,10 @@ namespace rtsp_stream {
 
   void terminate_sessions() {
     server.clear(true);
+  }
+
+  int terminate_sessions_by_uuid(const std::string_view &uuid) {
+    return server.terminate_by_uuid(uuid);
   }
 
   int send(tcp::socket &sock, const std::string_view &sv) {
