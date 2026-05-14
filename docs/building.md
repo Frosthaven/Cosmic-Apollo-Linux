@@ -171,7 +171,7 @@ It may be beneficial to build remotely in some cases. This will enable easier bu
 
 | Previous                              |                            Next |
 |:--------------------------------------|--------------------------------:|
-| [Troubleshooting](troubleshooting.md) | [Contributing](contributing.md) |
+| [Troubleshooting](troubleshooting.md) |                                 |
 
 </div>
 
