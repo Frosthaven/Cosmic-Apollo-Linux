@@ -6,6 +6,7 @@
 
 // standard includes
 #include <array>
+#include <unordered_map>
 
 // lib includes
 #include <list>
@@ -107,10 +108,12 @@ namespace crypto {
     bool enable_legacy_ordering;
     bool allow_client_commands;
     bool always_use_virtual_display;
-    // Per-client EVDI display scale (cosmic-comp scale factor like 1.0/1.25/1.5/2.0).
-    // 0 = no remembered value; apollo leaves the virtual display alone on connect
-    // and snapshots whatever scale the client ends the session at on disconnect.
-    double preferred_evdi_scale {0.0};
+    // Per-client EVDI display scale (cosmic-comp scale factor like 1.0/1.25/1.5/2.0),
+    // keyed by streaming resolution "WxH" (e.g. "1920x1080"). A "*" key acts as
+    // a fallback for resolutions without a specific entry. Empty map means no
+    // preference; apollo applies scale 1.0 on first connect to keep behavior
+    // deterministic, then captures whatever the user adjusts to.
+    std::unordered_map<std::string, double> preferred_evdi_scales;
   };
 
   using p_named_cert_t = std::shared_ptr<named_cert_t>;

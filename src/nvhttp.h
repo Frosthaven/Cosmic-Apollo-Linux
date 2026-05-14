@@ -283,12 +283,15 @@ namespace nvhttp {
     const bool always_use_virtual_display
   );
 
-  // Returns the saved EVDI display scale for the client paired with `uuid`,
-  // or 0.0 if the client is unknown or has no saved scale yet.
-  double get_client_evdi_scale(const std::string& uuid);
+  // Returns the saved EVDI display scale for the client paired with `uuid`
+  // at resolution `width`x`height`. Falls back to the wildcard "*" entry if
+  // no exact match exists. Returns 0.0 if neither is set or the client is
+  // unknown.
+  double get_client_evdi_scale(const std::string& uuid, int width, int height);
 
-  // Stores `scale` as the saved EVDI display scale for the client paired
-  // with `uuid` and persists sunshine_state.json. Returns true if the
-  // client was found and the state was written.
-  bool update_client_evdi_scale(const std::string& uuid, double scale);
+  // Stores `scale` as the EVDI display scale for the client paired with
+  // `uuid` at resolution `width`x`height` and persists sunshine_state.json.
+  // Returns true if the client was found and the state was written (or the
+  // value already matched).
+  bool update_client_evdi_scale(const std::string& uuid, int width, int height, double scale);
 }  // namespace nvhttp

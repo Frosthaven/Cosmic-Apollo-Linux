@@ -1131,6 +1131,10 @@ namespace platf {
           // last session is ending. Both empty == no per-client snapshot.
           std::string client_uuid;
           std::string evdi_output_name;
+          // Streaming resolution for this session (the key the saved scale
+          // is recorded under). 0/0 means we can't snapshot.
+          int width {0};
+          int height {0};
           ~OutputRestoreGuard() {
             BOOST_LOG(info) << "[evdi_grab][debug] ~OutputRestoreGuard fired";
             // Multi-client gate: if other streaming sessions are still
@@ -1178,12 +1182,14 @@ namespace platf {
             // Runs only on the last-session-ending branch (we already
             // returned above for multi-client overlap), so we attribute
             // the snapshot exclusively to the last client to disconnect.
-            if (!client_uuid.empty() && !evdi_output_name.empty()) {
+            if (!client_uuid.empty() && !evdi_output_name.empty() &&
+                width > 0 && height > 0) {
               auto cur = read_evdi_scale(evdi_output_name);
               if (cur && *cur > 0.0) {
-                if (nvhttp::update_client_evdi_scale(client_uuid, *cur)) {
+                if (nvhttp::update_client_evdi_scale(client_uuid, width, height, *cur)) {
                   BOOST_LOG(info) << "[evdi_grab] Saved EVDI scale " << *cur
-                                  << " for client " << client_uuid;
+                                  << " for client " << client_uuid
+                                  << " @ " << width << "x" << height;
                 } else {
                   BOOST_LOG(warning) << "[evdi_grab] Could not save EVDI scale "
                                         "for client " << client_uuid
@@ -1380,6 +1386,8 @@ namespace platf {
         OutputRestoreGuard restore_guard {false};
         restore_guard.client_uuid = client_uuid_;
         restore_guard.evdi_output_name = evdi_output_name_;
+        restore_guard.width = requested_width_;
+        restore_guard.height = requested_height_;
 
         // We only disable the physical outputs once we've confirmed this
         // capture loop is an actual streaming session (not a transient
@@ -1401,6 +1409,21 @@ namespace platf {
         // actually do anything (which would break the resume path).
         bool disable_check_done = false;
 
+        // Periodic EVDI-scale snapshot. The teardown destructor's
+        // read_evdi_scale isn't always reliable — Quit Session from
+        // inside the stream tears the EVDI off cosmic-comp's layout
+        // before the destructor runs, so cosmic-randr no longer reports
+        // a scale to capture. Polling during the stream means any scale
+        // the user changes in COSMIC Settings is persisted within ~5s,
+        // independent of how the session ends.
+        //
+        // last_known_scale gates writes to actual changes: nvhttp's
+        // update_client_evdi_scale skips JSON writes when value matches,
+        // but we still avoid the log spam by checking here.
+        auto next_scale_save = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(5);
+        double last_known_scale = 0.0;
+
         auto next_frame = std::chrono::steady_clock::now();
         sleep_overshoot_logger.reset();
 
@@ -1414,6 +1437,26 @@ namespace platf {
           next_frame += delay_;
           if (next_frame < now) {
             next_frame = now + delay_;
+          }
+
+          // Periodic snapshot of the EVDI's live scale so the saved
+          // value tracks any mid-session changes the user makes in
+          // COSMIC Settings, independent of how the session ends.
+          // Only runs after the 1.5s gate has applied/seeded so the
+          // initial Sunshine encoder-probe display_t's brief lifetime
+          // doesn't trigger writes for the wrong reason.
+          if (disable_check_done && now >= next_scale_save &&
+              !client_uuid_.empty() && !evdi_output_name_.empty()) {
+            next_scale_save = now + std::chrono::seconds(5);
+            auto cur = read_evdi_scale(evdi_output_name_);
+            if (cur && *cur > 0.0 && *cur != last_known_scale) {
+              if (nvhttp::update_client_evdi_scale(client_uuid_, requested_width_, requested_height_, *cur)) {
+                BOOST_LOG(info) << "[evdi_grab] EVDI scale changed to " << *cur
+                                << " — saved for client " << client_uuid_
+                                << " @ " << requested_width_ << "x" << requested_height_;
+                last_known_scale = *cur;
+              }
+            }
           }
 
           // Time-only streaming-detection gate.
@@ -1432,12 +1475,15 @@ namespace platf {
             // mid-session becomes their saved preference at teardown.
             if (!client_uuid_.empty() && !evdi_output_name_.empty() &&
                 stream::session::active_session_count() <= 1) {
-              double saved = nvhttp::get_client_evdi_scale(client_uuid_);
+              double saved = nvhttp::get_client_evdi_scale(
+                  client_uuid_, requested_width_, requested_height_);
               double target = (saved > 0.0) ? saved : 1.0;
               if (apply_evdi_scale(evdi_output_name_, target)) {
                 BOOST_LOG(info) << "[evdi_grab] Applied EVDI scale " << target
                                 << " for client " << client_uuid_
+                                << " @ " << requested_width_ << "x" << requested_height_
                                 << (saved > 0.0 ? " (saved)" : " (default)");
+                last_known_scale = target;
               } else {
                 BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI scale "
                                     << target << " for client " << client_uuid_;

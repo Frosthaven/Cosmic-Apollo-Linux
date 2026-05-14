@@ -252,8 +252,12 @@ namespace nvhttp {
         named_cert_node["enable_legacy_ordering"] = named_cert_p->enable_legacy_ordering;
         named_cert_node["allow_client_commands"] = named_cert_p->allow_client_commands;
         named_cert_node["always_use_virtual_display"] = named_cert_p->always_use_virtual_display;
-        if (named_cert_p->preferred_evdi_scale > 0.0) {
-          named_cert_node["preferred_evdi_scale"] = named_cert_p->preferred_evdi_scale;
+        if (!named_cert_p->preferred_evdi_scales.empty()) {
+          nlohmann::json scales_node = nlohmann::json::object();
+          for (const auto &kv : named_cert_p->preferred_evdi_scales) {
+            scales_node[kv.first] = kv.second;
+          }
+          named_cert_node["preferred_evdi_scales"] = scales_node;
         }
 
         // Add "do" commands if available.
@@ -352,7 +356,24 @@ namespace nvhttp {
         named_cert_p->enable_legacy_ordering = el.value("enable_legacy_ordering", true);
         named_cert_p->allow_client_commands = el.value("allow_client_commands", true);
         named_cert_p->always_use_virtual_display = el.value("always_use_virtual_display", false);
-        named_cert_p->preferred_evdi_scale = el.value("preferred_evdi_scale", 0.0);
+        // New per-resolution map; key is "WxH" (e.g. "1920x1080") or "*"
+        // for the wildcard/fallback entry.
+        if (el.contains("preferred_evdi_scales") && el["preferred_evdi_scales"].is_object()) {
+          for (auto it = el["preferred_evdi_scales"].begin(); it != el["preferred_evdi_scales"].end(); ++it) {
+            if (it.value().is_number()) {
+              named_cert_p->preferred_evdi_scales[it.key()] = it.value().get<double>();
+            }
+          }
+        }
+        // Migrate legacy scalar `preferred_evdi_scale` to a wildcard entry
+        // if the map didn't get populated above. Old field is dropped on
+        // next save_state.
+        if (named_cert_p->preferred_evdi_scales.empty()) {
+          double legacy = el.value("preferred_evdi_scale", 0.0);
+          if (legacy > 0.0) {
+            named_cert_p->preferred_evdi_scales["*"] = legacy;
+          }
+        }
         // Load command entries for "do" and "undo" keys.
         named_cert_p->do_cmds = extract_command_entries(el, "do");
         named_cert_p->undo_cmds = extract_command_entries(el, "undo");
@@ -369,27 +390,42 @@ namespace nvhttp {
     client_root = client;
   }
 
-  double get_client_evdi_scale(const std::string& uuid) {
+  namespace {
+    std::string scale_key_for(int width, int height) {
+      return std::to_string(width) + "x" + std::to_string(height);
+    }
+  }  // namespace
+
+  double get_client_evdi_scale(const std::string& uuid, int width, int height) {
+    auto key = scale_key_for(width, height);
     for (auto &named_cert : client_root.named_devices) {
-      if (named_cert->uuid == uuid) {
-        return named_cert->preferred_evdi_scale;
+      if (named_cert->uuid != uuid) continue;
+      auto exact = named_cert->preferred_evdi_scales.find(key);
+      if (exact != named_cert->preferred_evdi_scales.end()) {
+        return exact->second;
       }
+      auto wildcard = named_cert->preferred_evdi_scales.find("*");
+      if (wildcard != named_cert->preferred_evdi_scales.end()) {
+        return wildcard->second;
+      }
+      return 0.0;
     }
     return 0.0;
   }
 
-  bool update_client_evdi_scale(const std::string& uuid, double scale) {
+  bool update_client_evdi_scale(const std::string& uuid, int width, int height, double scale) {
+    auto key = scale_key_for(width, height);
     for (auto &named_cert : client_root.named_devices) {
-      if (named_cert->uuid == uuid) {
-        if (named_cert->preferred_evdi_scale == scale) {
-          return true;  // no-op write avoided
-        }
-        named_cert->preferred_evdi_scale = scale;
-        if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
-          save_state();
-        }
-        return true;
+      if (named_cert->uuid != uuid) continue;
+      auto it = named_cert->preferred_evdi_scales.find(key);
+      if (it != named_cert->preferred_evdi_scales.end() && it->second == scale) {
+        return true;  // no-op write avoided
       }
+      named_cert->preferred_evdi_scales[key] = scale;
+      if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
+        save_state();
+      }
+      return true;
     }
     return false;
   }

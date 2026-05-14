@@ -22,7 +22,7 @@ seamlessly with Cosmic's compositor and misc tooling.
 - **Quick reconnect** - disconnecting and reconnecting from the same device is sub-second; the virtual display stays warm.
 - **Self-healing** - if apollo crashes mid-stream, the next start automatically turns your physical monitors back on, restores audio, re-enables tiling.
 - **Disconnect vs Quit Session do the right thing** - Disconnect leaves the app paused so you can resume; Quit Session actually closes it.
-- **Per-client display scale memory** - whatever cosmic-comp scale you set on the virtual display while streaming is remembered against the connecting client. Reconnect from the same client and the virtual display comes back at that scale. Brand-new clients start at 100% for a deterministic baseline. Only the first/sole client of a session sets the scale; followers inherit.
+- **Per-client display scale memory** - whatever cosmic-comp scale you set on the virtual display while streaming is remembered against the connecting client *and* the connecting resolution. Reconnect from the same client at the same resolution and the virtual display comes back at that scale. Different resolutions track their own scale independently. Brand-new clients/resolutions start at 100% for a deterministic baseline. Only the first/sole client of a session sets the scale; followers inherit.
 
 ## Requirements
 
