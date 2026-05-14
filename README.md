@@ -32,29 +32,129 @@ seamlessly with Cosmic's compositor and misc tooling.
 
 ## Installing
 
-Pre-built `.deb`, `.rpm`, Arch tarball, and `.AppImage` artifacts are on the [GitHub Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases). Build-from-source instructions below if you'd rather track master.
+Pre-built artifacts (`.deb`, `.rpm`, Arch tarball, `.AppImage`) are on the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases). Pick your distro below and follow the steps; each section is self-contained.
+
+<details>
+<summary><strong>Arch family (CachyOS, EndeavourOS, Manjaro)</strong></summary>
+
+**Option A: install the prebuilt tarball**
+
+Download `cosmic-apollo-linux-x86_64.tar.gz` from the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases) and extract it into `/`:
 
 ```bash
-# Install build + runtime deps (Arch / CachyOS)
-sudo pacman -S --needed \
-  cmake ninja gcc pkgconf boost openssl ffmpeg \
-  libcap libnotify libdrm libevdev libpulse opus \
-  miniupnpc nlohmann-json wayland evdi-dkms libevdi
+sudo tar -xzvf cosmic-apollo-linux-x86_64.tar.gz -C /
+sudo setcap cap_sys_admin+p /usr/bin/apollo
+sudo pacman -S --needed evdi-dkms libevdi
+```
 
-# Clone + build
+**Option B: build from source**
+
+```bash
+sudo pacman -S --needed \
+  cmake ninja gcc pkgconf openssl ffmpeg \
+  libcap libnotify libdrm libevdev libpulse opus \
+  miniupnpc nlohmann-json wayland evdi-dkms libevdi nodejs npm
+
 git clone https://github.com/Frosthaven/Cosmic-Apollo-Linux
 cd Cosmic-Apollo-Linux
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_STANDALONE_ASIO=ON
 cmake --build build --target sunshine -j$(nproc)
-
-# Install
 sudo install -Dm755 build/sunshine /usr/bin/apollo
 sudo setcap cap_sys_admin+p /usr/bin/apollo
 ```
 
+</details>
+
+<details>
+<summary><strong>Debian / Ubuntu / Pop!_OS</strong></summary>
+
+**Option A: install the prebuilt `.deb`**
+
+Download `cosmic-apollo_*_amd64.deb` from the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases) and install:
+
+```bash
+sudo apt install ./cosmic-apollo_*_amd64.deb
+sudo apt install evdi-dkms   # not in the .deb's hard Depends; install separately
+```
+
+**Option B: build from source**
+
+```bash
+sudo apt-get install -y \
+  build-essential cmake ninja-build git \
+  libssl-dev libpulse-dev libopus-dev \
+  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+  libdrm-dev libgbm-dev libwayland-dev libx11-dev libxrandr-dev \
+  libxfixes-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
+  libva-dev libvdpau-dev libcap-dev libcurl4-openssl-dev \
+  libnotify-dev libayatana-appindicator3-dev libevdev-dev \
+  libudev-dev libsystemd-dev libminiupnpc-dev libicu-dev libnuma-dev \
+  nodejs npm evdi-dkms
+
+git clone https://github.com/Frosthaven/Cosmic-Apollo-Linux
+cd Cosmic-Apollo-Linux
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_STANDALONE_ASIO=ON
+cmake --build build --target sunshine -j$(nproc)
+sudo install -Dm755 build/sunshine /usr/bin/apollo
+sudo setcap cap_sys_admin+p /usr/bin/apollo
+```
+
+</details>
+
+<details>
+<summary><strong>Fedora / COSMIC Spin</strong></summary>
+
+**Option A: install the prebuilt `.rpm`**
+
+Download `cosmic-apollo-*.x86_64.rpm` from the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases) and install:
+
+```bash
+sudo dnf install ./cosmic-apollo-*.x86_64.rpm
+sudo dnf install evdi   # install separately
+```
+
+**Option B: build from source**
+
+```bash
+sudo dnf install -y \
+  git cmake ninja-build gcc-c++ \
+  openssl-devel opus-devel ffmpeg-free-devel \
+  libdrm-devel mesa-libgbm-devel wayland-devel \
+  libX11-devel libXrandr-devel libXfixes-devel libxcb-devel \
+  libva-devel libvdpau-devel libcap-devel libcurl-devel \
+  libnotify-devel libayatana-appindicator-gtk3-devel libevdev-devel \
+  systemd-devel miniupnpc-devel pulseaudio-libs-devel \
+  libicu-devel numactl-devel nodejs npm evdi
+
+git clone https://github.com/Frosthaven/Cosmic-Apollo-Linux
+cd Cosmic-Apollo-Linux
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+  -DSUNSHINE_ENABLE_WAYLAND=ON -DSUNSHINE_ENABLE_X11=ON -DSUNSHINE_ENABLE_DRM=ON
+cmake --build build --target sunshine -j$(nproc)
+sudo install -Dm755 build/sunshine /usr/bin/apollo
+sudo setcap cap_sys_admin+p /usr/bin/apollo
+```
+
+</details>
+
+<details>
+<summary><strong>Universal AppImage (any distro)</strong></summary>
+
+Download `cosmic-apollo-linux-x86_64.AppImage` from the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases):
+
+```bash
+chmod +x cosmic-apollo-linux-x86_64.AppImage
+sudo mv cosmic-apollo-linux-x86_64.AppImage /usr/local/bin/apollo
+sudo setcap cap_sys_admin+p /usr/local/bin/apollo
+```
+
+You'll still need EVDI from your distro's package manager (search for `evdi-dkms` or `evdi`). Without EVDI the daemon runs but no virtual displays can be created.
+
+</details>
+
 ### Give yourself permission to use EVDI
 
-Once, set up udev + tmpfiles entries so apollo can manage virtual displays without `sudo`:
+Distro-agnostic. Apollo manages virtual displays without `sudo` once these udev + tmpfiles entries exist:
 
 ```bash
 sudo tee /etc/udev/rules.d/99-evdi.rules > /dev/null <<'EOF'
@@ -67,7 +167,7 @@ z /sys/devices/evdi/remove_all 0220 root video -
 EOF
 
 sudo udevadm control --reload-rules && sudo udevadm trigger
-sudo systemd-tmpfiles --create
+sudo systemd-tmpfiles --create   # or apply manually if your init isn't systemd (see below)
 sudo modprobe evdi
 
 # Make sure you're in the video group
@@ -76,6 +176,11 @@ sudo usermod -aG video $USER
 ```
 
 ### Run apollo on login
+
+COSMIC requires `logind` (systemd-logind or `elogind`) for seat management, but it doesn't dictate your init system. Pick the section that matches what you actually use to run user services:
+
+<details>
+<summary><strong>systemd (default on most COSMIC installs)</strong></summary>
 
 Create `~/.config/systemd/user/apollo.service`:
 
@@ -101,6 +206,81 @@ WantedBy=graphical-session.target
 systemctl --user daemon-reload
 systemctl --user enable --now apollo.service
 ```
+
+</details>
+
+<details>
+<summary><strong>OpenRC (Artix, Gentoo)</strong></summary>
+
+OpenRC doesn't ship a per-user service manager. The recommended path on OpenRC + COSMIC is to launch apollo via XDG autostart so it starts with the desktop session.
+
+Create `~/.config/autostart/apollo.desktop`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Apollo
+Exec=/bin/sh -c 'until [ -n "$WAYLAND_DISPLAY" ]; do sleep 0.5; done; exec /usr/bin/apollo'
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+```
+
+It'll start when COSMIC launches. If apollo crashes, restart it manually (no auto-restart). If you want auto-restart, wrap it:
+
+```ini
+Exec=/bin/sh -c 'until [ -n "$WAYLAND_DISPLAY" ]; do sleep 0.5; done; while true; do /usr/bin/apollo; sleep 2; done'
+```
+
+</details>
+
+<details>
+<summary><strong>runit (Void, Artix-runit)</strong></summary>
+
+If you have `runit-user` (per-user runit) configured, create `~/runit/apollo/run`:
+
+```sh
+#!/bin/sh
+exec 2>&1
+until [ -n "$WAYLAND_DISPLAY" ]; do sleep 0.5; done
+exec /usr/bin/apollo
+```
+
+```bash
+chmod +x ~/runit/apollo/run
+ln -s ~/runit/apollo ~/runit/runsvdir/current/
+```
+
+If you don't have per-user runit, use the XDG autostart approach from the OpenRC section instead.
+
+</details>
+
+<details>
+<summary><strong>dinit</strong></summary>
+
+dinit has first-class per-user support. Create `~/.config/dinit.d/apollo`:
+
+```
+type = process
+command = /bin/sh -c 'until [ -n "$WAYLAND_DISPLAY" ]; do sleep 0.5; done; exec /usr/bin/apollo'
+restart = true
+smooth-recovery = true
+```
+
+Then start it:
+
+```bash
+dinitctl --user enable apollo
+dinitctl --user start apollo
+```
+
+</details>
+
+<details>
+<summary><strong>s6 / s6-rc</strong></summary>
+
+Use the XDG autostart entry from the OpenRC section. For a proper per-user s6-rc setup, follow your distro's per-user s6 docs — apollo just needs to be exec'd after `$WAYLAND_DISPLAY` is set.
+
+</details>
 
 ## First-time setup
 
