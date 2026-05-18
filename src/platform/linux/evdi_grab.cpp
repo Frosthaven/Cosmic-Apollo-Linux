@@ -1561,6 +1561,19 @@ namespace platf {
         auto next_scale_save = std::chrono::steady_clock::now() +
                                 std::chrono::seconds(5);
         double last_known_scale = 0.0;
+        // The connect-time atomic mode+scale apply runs in a detached
+        // thread (see the 1.5s gate's no-physicals / split-disable
+        // branches). That thread can take up to ~8s when cosmic-comp is
+        // slow at >4K mode-sets. Until it lands, cosmic-comp's scale is
+        // its post-mode-change default of 1.0 — and if this monitor
+        // polls during that window it will see 1.0 and persist 1.0,
+        // clobbering the user's saved preference before the apply has
+        // a chance to set it. Gate the monitor on a flag set by the
+        // apply thread so the first poll only happens after the apply
+        // has attempted (success or failure — either way, whatever
+        // cosmic-comp is at by then is the post-apply state and any
+        // further change reflects the user's intent).
+        auto scale_apply_done = std::make_shared<std::atomic<bool>>(false);
 
         auto next_frame = std::chrono::steady_clock::now();
         sleep_overshoot_logger.reset();
@@ -1584,6 +1597,7 @@ namespace platf {
           // initial Sunshine encoder-probe display_t's brief lifetime
           // doesn't trigger writes for the wrong reason.
           if (disable_check_done && now >= next_scale_save &&
+              scale_apply_done->load(std::memory_order_acquire) &&
               !client_uuid_.empty() && !evdi_output_name_.empty()) {
             next_scale_save = now + std::chrono::seconds(5);
             auto cur = read_evdi_scale(evdi_output_name_);
@@ -1706,7 +1720,8 @@ namespace platf {
                   std::thread([uuid = client_uuid_,
                                w = requested_width_,
                                h = requested_height_,
-                               evdi = evdi_output_name_]() {
+                               evdi = evdi_output_name_,
+                               apply_done = scale_apply_done]() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(800));
                     // Apply mode AND scale atomically — see apply_evdi_mode
                     // docs. cosmic-comp resets scale to 1.0 as part of any
@@ -1729,7 +1744,19 @@ namespace platf {
                                          << " @ " << target << " for client "
                                          << uuid;
                     }
+                    // Release the monitor so it can start polling — see
+                    // the scale_apply_done declaration. Set after apply
+                    // returns regardless of success; whatever cosmic-comp
+                    // is at by now is what subsequent user changes will
+                    // diff against.
+                    apply_done->store(true, std::memory_order_release);
                   }).detach();
+                } else {
+                  // No apply thread will run (no client uuid or multi-
+                  // client overlap). Release the monitor immediately so
+                  // it isn't blocked forever. Multi-client sessions
+                  // don't apply scale anyway — see existing semantics.
+                  scale_apply_done->store(true, std::memory_order_release);
                 }
               }
 
@@ -1821,7 +1848,8 @@ namespace platf {
                              uuid = client_uuid_,
                              w = requested_width_,
                              h = requested_height_,
-                             first_session = (stream::session::active_session_count() <= 1)
+                             first_session = (stream::session::active_session_count() <= 1),
+                             apply_done = scale_apply_done
                             ]() mutable {
                   // EVDI enable as safety net — should already be
                   // enabled from init()'s pre-check, but the apply is
@@ -1924,6 +1952,10 @@ namespace platf {
                                          << uuid;
                     }
                   }
+                  // Release the live-scale monitor — see scale_apply_done
+                  // declaration. Always set, even on non-first-session
+                  // overlap, so the monitor doesn't block forever.
+                  apply_done->store(true, std::memory_order_release);
                 }).detach();
               }
             }

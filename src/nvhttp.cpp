@@ -397,16 +397,21 @@ namespace nvhttp {
   }  // namespace
 
   double get_client_evdi_scale(const std::string& uuid, int width, int height) {
+    // Exact-resolution match only. The legacy `"*"` wildcard entry
+    // (created during the one-time migration from the old scalar
+    // storage in the json upgrade path) is intentionally ignored
+    // here so unknown resolutions cleanly default to 1.0 at the
+    // call site rather than inheriting whatever scale the user
+    // happened to have set when they first paired. This means a
+    // brand-new resolution gets a deterministic baseline; the
+    // user's scale gets persisted at session-end and applied on
+    // every reconnect at that same resolution afterwards.
     auto key = scale_key_for(width, height);
     for (auto &named_cert : client_root.named_devices) {
       if (named_cert->uuid != uuid) continue;
       auto exact = named_cert->preferred_evdi_scales.find(key);
       if (exact != named_cert->preferred_evdi_scales.end()) {
         return exact->second;
-      }
-      auto wildcard = named_cert->preferred_evdi_scales.find("*");
-      if (wildcard != named_cert->preferred_evdi_scales.end()) {
-        return wildcard->second;
       }
       return 0.0;
     }
