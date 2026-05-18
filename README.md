@@ -1,7 +1,7 @@
 # Cosmic-Apollo-Linux
 
 > [!NOTE]
-> This is an AI assisted personal fork intended for personal use, but made
+> 🤖 This is an AI assisted personal fork intended for personal use, but made
 > public for all who are interested.
 
 This is a fork of [Mr0z59/Apollo-Linux](https://github.com/MrOz59/Apollo-Linux) (which itself forks [ClassicOldSong/Apollo](https://github.com/ClassicOldSong/Apollo)) tuned specifically for **COSMIC** running on Wayland. You stream to clients with **[Moonlight](https://moonlight-stream.org/)** (any platform) or **[Artemis](https://github.com/ClassicOldSong/moonlight-android)** (Android, fork of Moonlight with extra features).
