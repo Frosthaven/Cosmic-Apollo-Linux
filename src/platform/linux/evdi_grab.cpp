@@ -197,28 +197,6 @@ namespace platf {
       return found_evdi && total_w > 0 && total_h > 0;
     }
 
-    // Tell cosmic-comp to switch the EVDI output to the desired mode if it
-    // isn't already there. cosmic-comp tends to remember the last mode it
-    // set on an output and ignore the EDID's "preferred" mode on subsequent
-    // hotplugs, so we have to nudge it explicitly.
-    bool force_evdi_mode(const std::string &output_name, int width, int height) {
-      if (output_name.empty() || width <= 0 || height <= 0) {
-        return false;
-      }
-      char cmd[256];
-      std::snprintf(cmd, sizeof(cmd),
-                    "cosmic-randr mode \"%s\" %d %d 2>/dev/null",
-                    output_name.c_str(), width, height);
-      int rc = std::system(cmd);
-      if (rc != 0) {
-        BOOST_LOG(warning) << "[evdi_grab] cosmic-randr mode '" << output_name
-                            << " " << width << "x" << height
-                            << "' returned " << rc;
-        return false;
-      }
-      return true;
-    }
-
     // Persistent state file: a newline-separated list of output names we
     // disabled during a streaming session. Written when we disable, deleted
     // when we restore on clean exit. Read at init() to recover from a
@@ -904,6 +882,43 @@ namespace platf {
       if (rc != 0 || wrote != kdl.size()) {
         BOOST_LOG(warning) << "[evdi_grab] apply_evdi_scale: cosmic-randr kdl exit=" << rc
                             << " wrote=" << wrote << "/" << kdl.size();
+        return false;
+      }
+      return true;
+    }
+
+    // Force cosmic-comp to set a specific mode on a named output. Uses
+    // cosmic-randr's CLI `mode` subcommand rather than the kdl mutation
+    // path: simpler, no parsing of the live kdl needed, and the CLI
+    // resolves the refresh rate from the output's advertised modes
+    // automatically. We avoid passing --refresh because apollo's EDID
+    // advertises only one mode for the requested resolution, so there's
+    // nothing to disambiguate.
+    //
+    // Why this exists: after `evdi_disconnect → evdi_connect2(new_edid)`,
+    // cosmic-comp accepts the new EDID but doesn't reevaluate its current
+    // mode against the new EDID's preferred mode — it keeps whatever
+    // mode was active when this EVDI plane was first seen this session.
+    // Result: a 1080p-first session leaves cosmic-comp's EVDI scanout
+    // framebuffer at 1080p forever, and apollo's correctly-sized capture
+    // buffer for any subsequent resolution mismatches efb->base.{width,
+    // height} inside the kernel — grab_pixels returns -EINVAL on every
+    // call (see evdi_painter.c:1144) and the client sees black. Calling
+    // `cosmic-randr mode` after each EDID swap forces cosmic-comp to
+    // resize the scanout fb to match what apollo asked for.
+    bool apply_evdi_mode(const std::string &output_name, int width, int height) {
+      if (output_name.empty() || width <= 0 || height <= 0) return false;
+      char cmd[256];
+      std::snprintf(cmd, sizeof(cmd),
+                    "timeout 8 cosmic-randr mode \"%s\" %d %d "
+                    ">/dev/null 2>/tmp/apollo-last-mode-stderr.log",
+                    output_name.c_str(), width, height);
+      int rc = std::system(cmd);
+      if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+        BOOST_LOG(warning) << "[evdi_grab] apply_evdi_mode: cosmic-randr "
+                              "mode failed for " << output_name << " "
+                           << width << "x" << height << " (rc=" << rc
+                           << ", stderr at /tmp/apollo-last-mode-stderr.log)";
         return false;
       }
       return true;
@@ -1608,6 +1623,22 @@ namespace platf {
                                h = requested_height_,
                                evdi = evdi_output_name_]() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(800));
+                    // Force cosmic-comp to size its EVDI scanout fb to match
+                    // what apollo registered. See apply_evdi_mode docs:
+                    // cosmic-comp keeps the old mode on EDID swap, which
+                    // leaves apollo's correctly-sized capture buffer at a
+                    // mismatched dimension and makes grab_pixels return
+                    // -EINVAL on every call (black screen). Doing this in
+                    // the same post-stable thread as the scale-apply avoids
+                    // the probe-phase races that prevent us from doing it
+                    // in init() (see the NOTE there).
+                    if (apply_evdi_mode(evdi, w, h)) {
+                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI mode "
+                                      << w << "x" << h << " to " << evdi;
+                      // Give cosmic-comp a tick to resize the scanout fb
+                      // before the scale apply or capture queries hit it.
+                      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
                     double saved = nvhttp::get_client_evdi_scale(uuid, w, h);
                     double target = (saved > 0.0) ? saved : 1.0;
                     if (apply_evdi_scale(evdi, target)) {
@@ -1792,6 +1823,20 @@ namespace platf {
                   // the responder has just settled from the last 500ms gap +
                   // health check, so a fresh scale-apply lands cleanly.
                   if (first_session && !uuid.empty() && !evdi.empty()) {
+                    // Force cosmic-comp to size its EVDI scanout fb to
+                    // match what apollo registered (mode-apply before
+                    // scale-apply). See apply_evdi_mode docs: without
+                    // this, switching between resolutions in a single
+                    // apollo lifetime leaves the scanout fb at the
+                    // first-session mode and grab_pixels returns -EINVAL
+                    // on every call (black screen for the client).
+                    if (apply_evdi_mode(evdi, w, h)) {
+                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI mode "
+                                      << w << "x" << h << " to " << evdi;
+                      // Give cosmic-comp a tick to resize the scanout fb
+                      // before the scale apply lands.
+                      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
                     double saved = nvhttp::get_client_evdi_scale(uuid, w, h);
                     double target = (saved > 0.0) ? saved : 1.0;
                     if (apply_evdi_scale(evdi, target)) {
