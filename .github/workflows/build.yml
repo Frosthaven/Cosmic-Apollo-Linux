@@ -285,7 +285,7 @@ jobs:
 
       - name: Create DEB Package
         run: |
-          VERSION="0.4.0"
+          VERSION="0.4.1"
           PKGDIR="cosmic-apollo-linux_${VERSION}_amd64"
 
           mkdir -p ${PKGDIR}/DEBIAN
@@ -442,7 +442,7 @@ jobs:
       - name: Create RPM Package
         run: |
           set -e
-          VERSION="0.4.0"
+          VERSION="0.4.1"
           mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
           # Stage source files for the RPM. The cmake target is named

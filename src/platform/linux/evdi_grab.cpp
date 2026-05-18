@@ -1659,6 +1659,16 @@ namespace platf {
             const bool is_desktop_session =
                 app == "Remote Input" || app == "Desktop" ||
                 app == "Low Res Desktop";
+            // Desktop-style sessions ALSO skip the physicals-disable train
+            // below. The split-disable triggers a known cosmic-comp deadlock
+            // (see surface/mod.rs Drop comment about apply_config_for_outputs)
+            // where dropping a physical's Surface mid-apply stalls the next
+            // apply indefinitely. Desktop streams have no reason to hide
+            // physicals — the user is just remoting into their normal Wayland
+            // session and seeing the full layout is the point. Game/app
+            // streams still get the disable to force fullscreen apps onto
+            // the EVDI.
+            const bool skip_physicals_disable = is_desktop_session;
             if (is_desktop_session) {
               BOOST_LOG(info) << "[evdi_grab] Keeping cosmic-comp autotile "
                                  "enabled for desktop-style session (app: "
@@ -1674,11 +1684,18 @@ namespace platf {
                                     "fullscreen-borderless games may tile";
             }
 
-            if (disabled_outputs_.empty()) {
-              // No physicals tracked this session — either find_compositor_
-              // layout saw only the EVDI (race with cosmic-comp's hotplug
-              // settling) or the user genuinely has no physicals. Either
-              // way, do NOTHING on disconnect. If we armed the restore,
+            if (disabled_outputs_.empty() || skip_physicals_disable) {
+              // Three reasons to take this no-disable branch:
+              //   1. disabled_outputs_ is empty (find_compositor_layout saw
+              //      only the EVDI, or the user genuinely has no physicals)
+              //   2. desktop-style session — we deliberately keep physicals
+              //      on so the user's normal Wayland layout is visible on
+              //      the client (see skip_physicals_disable above)
+              //   3. (legacy) cosmic-comp wlr-output-management was
+              //      unresponsive at pre-flight — the path below catches
+              //      that and reroutes here too
+              // In all three cases, do NOTHING on disconnect. If we armed
+              // the restore,
               // the destructor's force-disconnect of the EVDI would break
               // the resume path (cosmic-comp drops the EVDI output, and
               // the next "resume" RTSP session reuses the same launch_
@@ -1691,9 +1708,19 @@ namespace platf {
               // startup with the disabled-outputs state file + known-
               // physicals snapshot. No need to also try to be heroic
               // here.
-              BOOST_LOG(info) << "[evdi_grab] No physical outputs to disable "
-                              << "this session — skipping disable AND restore "
-                              << "(EVDI stays connected so resume works)";
+              if (skip_physicals_disable && !disabled_outputs_.empty()) {
+                BOOST_LOG(info) << "[evdi_grab] Skipping physicals disable for "
+                                << "desktop-style session (app: " << app
+                                << ", would-have-disabled=" << disabled_outputs_.size()
+                                << "). Workaround for cosmic-comp Surface Drop "
+                                   "deadlock during multi-output reconfigure on "
+                                   "the same apply chain. Physicals stay on; "
+                                   "user sees full desktop on client.";
+              } else {
+                BOOST_LOG(info) << "[evdi_grab] No physical outputs to disable "
+                                << "this session — skipping disable AND restore "
+                                << "(EVDI stays connected so resume works)";
+              }
               static thread_local bool logged_empty {false};
               logged_empty = true;
 
