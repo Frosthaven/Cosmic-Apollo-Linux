@@ -2001,6 +2001,31 @@ namespace platf {
     if (restore_targets.empty()) {
       return;
     }
+
+    // Probe cosmic-comp's apply path BEFORE issuing the recovery apply.
+    // Observed cascade today: the previous session wedged cosmic-comp;
+    // state files persisted with a bogus captured mode (e.g. HDMI-A-2 at
+    // 800x480 — what cosmic-comp reported during its wedge); next boot
+    // apollo's startup recovery applied that bogus mode to a fresh
+    // cosmic-comp and re-wedged it; cycle repeats every reboot until
+    // state files are manually wiped. apply_output_kdl_sync's return
+    // value isn't a reliable signal here — the apply can succeed at
+    // the IPC level (cosmic-randr exits 0) while pushing the compositor
+    // into a wedged state asynchronously. The probe sends a no-op apply
+    // and is the only reliable health check for this path.
+    if (!cosmic_comp_apply_responsive()) {
+      BOOST_LOG(warning) << "[evdi_grab] startup recovery: cosmic-comp "
+                            "apply path unresponsive — skipping recovery "
+                            "of " << restore_targets.size() << " outputs "
+                            "and clearing stale state files to prevent a "
+                            "re-wedge cascade across reboots. If physicals "
+                            "are missing after this, re-enable them via "
+                            "cosmic-settings (Displays page).";
+      clear_disabled_state();
+      clear_disabled_modes();
+      return;
+    }
+
     BOOST_LOG(info) << "[evdi_grab] startup recovery: re-enabling "
                     << restore_targets.size() << " outputs (leftover="
                     << leftover.size() << ", snapshot=" << snapshot.size()
@@ -2011,8 +2036,19 @@ namespace platf {
       clear_disabled_modes();
       BOOST_LOG(info) << "[evdi_grab] startup recovery complete";
     } else {
-      BOOST_LOG(warning) << "[evdi_grab] startup recovery apply failed — "
-                            "state files kept for retry on first stream session";
+      // Apply failed despite the probe passing. Probably a malformed
+      // mode in the state (the probe only validates that cosmic-comp
+      // will TAKE an apply, not that the specific apply payload is
+      // sane). Clear state regardless — keeping it would re-attempt
+      // the same broken payload on every restart, which is exactly
+      // the cascade we're trying to prevent. User can manually
+      // re-enable any missing physicals via cosmic-settings.
+      BOOST_LOG(warning) << "[evdi_grab] startup recovery apply failed "
+                            "despite probe passing — clearing state files "
+                            "to prevent retry loop; re-enable physicals "
+                            "via cosmic-settings if needed";
+      clear_disabled_state();
+      clear_disabled_modes();
     }
   }
 
