@@ -15,6 +15,7 @@
 
 // standard includes
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -752,8 +753,10 @@ namespace platf {
       }
 
       // Pipe to cosmic-randr kdl. One IPC request, atomic apply, atomic
-      // rollback on failure inside cosmic-comp.
-      FILE *w = ::popen("timeout 5 cosmic-randr kdl 2>/tmp/apollo-last-kdl-stderr.log", "w");
+      // rollback on failure inside cosmic-comp. Bumped from 5s → 8s because
+      // 5K mode-sets (e.g. 5120x2880 EVDI) take real wall-clock time and
+      // the original 5s killed legitimately-slow but recoverable applies.
+      FILE *w = ::popen("timeout 8 cosmic-randr kdl 2>/tmp/apollo-last-kdl-stderr.log", "w");
       if (!w) {
         BOOST_LOG(warning) << "[evdi_grab] failed to launch cosmic-randr kdl";
         return false;
@@ -890,7 +893,8 @@ namespace platf {
         std::fwrite(kdl.data(), 1, kdl.size(), dump);
         std::fclose(dump);
       }
-      FILE *w = ::popen("timeout 5 cosmic-randr kdl 2>/tmp/apollo-last-kdl-stderr.log", "w");
+      // 8s timeout matches apply_output_kdl_sync — see rationale there.
+      FILE *w = ::popen("timeout 8 cosmic-randr kdl 2>/tmp/apollo-last-kdl-stderr.log", "w");
       if (!w) {
         BOOST_LOG(warning) << "[evdi_grab] apply_evdi_scale: failed to launch cosmic-randr kdl";
         return false;
@@ -921,6 +925,46 @@ namespace platf {
                     timeout_ms / 1000, timeout_ms % 1000);
       int rc = std::system(cmd);
       return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
+    }
+
+    // Probe the wlr-output-management APPLY code path. `cosmic_comp_responsive`
+    // above only tests `cosmic-randr list`, which is served by a different
+    // dispatcher inside cosmic-comp than `apply`. We've observed wedges where
+    // `list` is fast but `apply` deadlocks for >5s — a half-stuck state that
+    // the list-only probe can't detect. This helper captures current config
+    // (cheap) and pipes it back as a no-op apply (cosmic-comp will reconcile
+    // against current state and return immediately on a healthy responder).
+    // Splits the timeout budget across the two stages so total latency stays
+    // close to the list-only probe's budget.
+    bool cosmic_comp_apply_responsive(int timeout_ms = 1500) {
+      int read_budget = timeout_ms / 2;
+      int write_budget = timeout_ms - read_budget;
+      std::string kdl;
+      char read_cmd[96];
+      std::snprintf(read_cmd, sizeof(read_cmd),
+                    "timeout %d.%03d cosmic-randr list --kdl 2>/dev/null",
+                    read_budget / 1000, read_budget % 1000);
+      if (FILE *p = ::popen(read_cmd, "r")) {
+        std::array<char, 4096> chunk;
+        while (auto n = ::fread(chunk.data(), 1, chunk.size(), p)) {
+          kdl.append(chunk.data(), n);
+        }
+        int rrc = ::pclose(p);
+        if (!WIFEXITED(rrc) || WEXITSTATUS(rrc) != 0 || kdl.empty()) {
+          return false;
+        }
+      } else {
+        return false;
+      }
+      char write_cmd[96];
+      std::snprintf(write_cmd, sizeof(write_cmd),
+                    "timeout %d.%03d cosmic-randr kdl >/dev/null 2>/dev/null",
+                    write_budget / 1000, write_budget % 1000);
+      FILE *w = ::popen(write_cmd, "w");
+      if (!w) return false;
+      size_t wrote = ::fwrite(kdl.data(), 1, kdl.size(), w);
+      int wrc = ::pclose(w);
+      return WIFEXITED(wrc) && WEXITSTATUS(wrc) == 0 && wrote == kdl.size();
     }
 
     class evdi_display_t: public display_t {
@@ -1126,6 +1170,14 @@ namespace platf {
         struct OutputRestoreGuard {
           bool armed {false};
           bool tiling_was_disabled {false};
+          // Set by the split-disable thread when it had to roll back a
+          // partial physicals-disable (an apply timed out partway through).
+          // The thread re-enables every output it had successfully disabled
+          // before bailing out, so by the time the destructor fires the
+          // physicals are already back — skip the in-process restore to
+          // avoid pushing more apply churn into a still-degraded compositor.
+          // Cross-thread visibility via atomic.
+          std::atomic<bool> inline_rollback_done {false};
           // Populated from the enclosing evdi_display_t at construction
           // so the destructor can snapshot per-client EVDI state when the
           // last session is ending. Both empty == no per-client snapshot.
@@ -1213,6 +1265,13 @@ namespace platf {
               }
             }
             if (!armed) return;
+            if (inline_rollback_done.load(std::memory_order_acquire)) {
+              BOOST_LOG(info) << "[evdi_grab] split-disable thread already "
+                                 "rolled back the partial disable — skipping "
+                                 "in-process restore to avoid duplicate apply "
+                                 "churn against a degraded compositor";
+              return;
+            }
             // In-process restore with restart fallback.
             //
             // The deadlock that froze prior in-process restore attempts
@@ -1584,16 +1643,26 @@ namespace platf {
               // entirely in that state — let the user stream in
               // degraded mode (physicals still on) instead of breaking
               // their desktop.
-              if (!cosmic_comp_responsive()) {
+              // Two-stage probe: `list` AND `apply`. Cosmic-comp can wedge
+              // such that `list` answers quickly but `apply` deadlocks
+              // (list and apply go through different dispatchers; the
+              // 5K-mode-set wedge bites apply specifically). If either
+              // is unresponsive, skip the split-disable train so we don't
+              // commit a partial reconfiguration that the compositor can't
+              // unwind.
+              bool list_ok = cosmic_comp_responsive();
+              bool apply_ok = list_ok && cosmic_comp_apply_responsive();
+              if (!list_ok || !apply_ok) {
                 BOOST_LOG(warning) << "[evdi_grab] cosmic-comp wlr-output-"
-                                      "management unresponsive (cosmic-randr "
-                                      "list didn't return in 1.5s) — skipping "
-                                      "physicals disable for this session. "
-                                      "Stream continues with physicals on. "
-                                      "Restore guard NOT armed (nothing to "
-                                      "restore). Cycle pressure has built up; "
-                                      "consider apollo restart between "
-                                      "sessions.";
+                                      "management unresponsive ("
+                                   << (list_ok ? "list ok, apply hung"
+                                               : "list hung")
+                                   << ") — skipping physicals disable for "
+                                      "this session. Stream continues with "
+                                      "physicals on. Restore guard NOT armed "
+                                      "(nothing to restore). Cycle pressure "
+                                      "has built up; consider apollo restart "
+                                      "between sessions.";
                 // Still ensure EVDI is enabled so streaming works
                 // (init()'s pre-check should have done this; this is
                 // belt-and-suspenders).
@@ -1636,7 +1705,8 @@ namespace platf {
                 // output that was never actually disabled is harmless
                 // (idempotent: enabled=#true on an enabled output).
                 restore_guard.armed = true;
-                std::thread([targets = disabled_outputs_,
+                std::thread([&inline_rb = restore_guard.inline_rollback_done,
+                             targets = disabled_outputs_,
                              evdi = evdi_output_name_,
                              uuid = client_uuid_,
                              w = requested_width_,
@@ -1651,24 +1721,63 @@ namespace platf {
                     std::this_thread::sleep_for(std::chrono::milliseconds(300));
                   }
 
+                  // Rollback helper: re-enable everything we disabled so
+                  // far. Called when an apply or health-check fails mid-way
+                  // through the split-disable train. Each re-enable goes
+                  // through the same atomic apply path; failures are logged
+                  // but the rollback continues — best effort.
+                  std::vector<std::string> already_disabled;
+                  auto rollback_partial = [&already_disabled, &inline_rb]
+                                            (const std::string &reason) {
+                    if (already_disabled.empty()) {
+                      BOOST_LOG(warning) << "[evdi_grab] " << reason
+                                         << " — no rollback needed (nothing "
+                                            "disabled yet)";
+                      inline_rb.store(true, std::memory_order_release);
+                      return;
+                    }
+                    BOOST_LOG(warning) << "[evdi_grab] " << reason
+                                       << " — rolling back "
+                                       << already_disabled.size()
+                                       << " previous disables to keep the "
+                                          "user's physicals on";
+                    for (const auto &n : already_disabled) {
+                      if (!apply_output_kdl_sync({}, {n})) {
+                        BOOST_LOG(warning) << "[evdi_grab] rollback re-enable "
+                                              "of " << n << " also failed — "
+                                              "compositor likely fully wedged, "
+                                              "continuing rollback attempts";
+                      } else {
+                        BOOST_LOG(info) << "[evdi_grab] rollback re-enabled "
+                                        << n;
+                      }
+                    }
+                    // Tell the destructor we handled physicals restore inline
+                    // — skipping its in-process restore avoids pushing more
+                    // apply churn into a still-degraded compositor.
+                    inline_rb.store(true, std::memory_order_release);
+                  };
+
                   for (const auto &name : targets) {
                     BOOST_LOG(info) << "[evdi_grab] Split disable: " << name;
                     if (!apply_output_kdl_sync({name}, {})) {
-                      BOOST_LOG(warning) << "[evdi_grab] Split disable of "
-                                          << name << " failed — aborting "
-                                             "remaining disables";
+                      rollback_partial("Split disable of " + name +
+                                       " failed (apply timed out or errored)");
                       return;
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    already_disabled.push_back(name);
+                    // Bumped from 500ms → 2000ms because 5K mode-sets need
+                    // more time for cosmic-comp to fully process each
+                    // transition before the next one lands; aggressive
+                    // gaps were the proximate cause of mid-train wedges.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
                     // Health check between applies. If cosmic-comp went
-                    // unresponsive after the last apply, stop pushing
-                    // more applies into it.
+                    // unresponsive after the last apply, roll back the
+                    // physicals we just disabled so we don't leave the
+                    // user with fewer outputs than they started with.
                     if (!cosmic_comp_responsive(1500)) {
-                      BOOST_LOG(warning) << "[evdi_grab] cosmic-comp went "
-                                            "unresponsive after disabling "
-                                          << name
-                                          << " — aborting further disables "
-                                             "to avoid full wedge";
+                      rollback_partial("cosmic-comp went unresponsive after "
+                                       "disabling " + name);
                       return;
                     }
                   }
