@@ -17,7 +17,7 @@ seamlessly with Cosmic's compositor and misc tooling.
 - **Automatic Monitor Swapping** - When connecting remotely, sound and video is
   sent through the virtual display. Primary monitor(s) are disabled. When all
   clients disconnect, the monitors are restored to what they were prior.
-- **Tiling automatically off during streams** - COSMIC's auto-tile is great for desktop work but makes fullscreen games a challenge. The fork toggles it off when you connect, back on when you disconnect (if it was on to start with).
+- **Tiling automatically off for app streams** - COSMIC's auto-tile is great for desktop work but makes fullscreen games a challenge. When you stream an app (e.g. Steam Big Picture), the fork toggles tiling off for the session and back on at disconnect (if it was on to start with). Desktop streams (Moonlight's default Desktop tile, or any apps.json entry named "Desktop" / "Low Res Desktop") keep tiling on — you're just remoting into your normal Wayland session.
 - **Multi-device sharing** - connect from multiple devices at the same time. First device decides the resolution; the second joins as a viewer. When everyone disconnects, things reset for the next "first."
 - **Quick reconnect** - disconnecting and reconnecting from the same device is sub-second; the virtual display stays warm.
 - **Self-healing** - if apollo crashes mid-stream, the next start automatically turns your physical monitors back on, restores audio, re-enables tiling.

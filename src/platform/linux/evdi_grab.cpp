@@ -34,6 +34,7 @@
 #include "src/input.h"
 #include "src/logging.h"
 #include "src/nvhttp.h"
+#include "src/process.h"
 #include "src/rtsp.h"
 #include "src/platform/common.h"
 #include "src/stream.h"
@@ -1619,9 +1620,30 @@ namespace platf {
             // at the 1.5s gate (not at session init) skips the
             // encoder-probe display_t instances that only exist for
             // a few hundred ms.
-            if (cosmic_tiling_disable()) {
+            // Skip the disable when the client is streaming a desktop-
+            // style app (the default Moonlight "Desktop" tile, or
+            // apps.json entries named "Desktop" / "Low Res Desktop").
+            // Those sessions are just remoting into the normal Wayland
+            // desktop where auto-tile is helpful; only games and other
+            // app streams (e.g. "Steam Big Picture") benefit from
+            // disabling auto-tile to get a clean fullscreen surface.
+            //
+            // "Remote Input" is apollo's internal app name when no
+            // apps.json entry matched (set in proc_t::launch_input_only
+            // — process.cpp:179). The two literal "Desktop" names come
+            // straight from src_assets/linux/assets/apps.json.
+            const std::string app = proc::proc.get_last_run_app_name();
+            const bool is_desktop_session =
+                app == "Remote Input" || app == "Desktop" ||
+                app == "Low Res Desktop";
+            if (is_desktop_session) {
+              BOOST_LOG(info) << "[evdi_grab] Keeping cosmic-comp autotile "
+                                 "enabled for desktop-style session (app: "
+                              << app << ")";
+            } else if (cosmic_tiling_disable()) {
               BOOST_LOG(info) << "[evdi_grab] Disabled cosmic-comp autotile "
-                              << "for stream session";
+                                 "for stream session (app: "
+                              << app << ")";
               restore_guard.tiling_was_disabled = true;
             } else {
               BOOST_LOG(warning) << "[evdi_grab] Failed to disable cosmic-comp "
