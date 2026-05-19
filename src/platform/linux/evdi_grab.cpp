@@ -774,6 +774,44 @@ namespace platf {
       }).detach();
     }
 
+    // Minimal-request equivalents of apply_output_kdl_sync. Invoke the
+    // cosmic-randr `disable <NAME>` and `enable <NAME>` subcommands
+    // directly instead of piping the full-world kdl payload. The kdl
+    // path was selected originally to bundle everything under one
+    // backend.lock() acquisition, on the theory that separate apply
+    // calls would race. Live observation contradicts that theory: the
+    // full-world kdl apply itself wedges cosmic-comp's render scheduler
+    // (DrmOutputManager::lock takes write on every per-device compositor
+    // RwLock, blocking all surface threads from reading; main thread
+    // then waits on a sync channel from those surface threads → hang).
+    // cosmic-settings GUI's display toggle is observed to work cleanly,
+    // and it issues the minimal-request shape (disable_head(target),
+    // skip everyone else) rather than the full-world re-apply. We
+    // replicate that here. 20s timeout matches the prior path.
+    //
+    // Returns true on cosmic-randr exit code 0, false otherwise.
+    bool cosmic_randr_disable(const std::string &output_name) {
+      if (output_name.empty()) return false;
+      // Output name comes from cosmic-randr list — alphanumeric +
+      // dash + digit, no quoting hazards. Defensive double-quote
+      // anyway in case future hardware introduces oddities.
+      char cmd[256];
+      std::snprintf(cmd, sizeof(cmd),
+                    "timeout 20 cosmic-randr disable \"%s\" >/dev/null 2>&1",
+                    output_name.c_str());
+      int rc = std::system(cmd);
+      return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
+    }
+    bool cosmic_randr_enable(const std::string &output_name) {
+      if (output_name.empty()) return false;
+      char cmd[256];
+      std::snprintf(cmd, sizeof(cmd),
+                    "timeout 20 cosmic-randr enable \"%s\" >/dev/null 2>&1",
+                    output_name.c_str());
+      int rc = std::system(cmd);
+      return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
+    }
+
     // Compatibility shim for single-output flips. Routes through the
     // atomic apply so multi-output transitions issued back-to-back
     // (e.g. disable A then disable B from a loop) still all share the
@@ -1876,10 +1914,12 @@ namespace platf {
                 BOOST_LOG(info) << "[evdi_grab] Disabling "
                                 << disabled_outputs_.size()
                                 << " physicals (preserved " << modes.size()
-                                << " modes) via SPLIT kdl applies "
-                                << "(one output per apply, poll wlr-output "
-                                << "for enabled=#false, then 1500ms settle "
-                                << "for render-thread cleanup before next)";
+                                << " modes) via SPLIT minimal cosmic-randr "
+                                << "disable calls (one output per call, "
+                                << "minimal-request shape matching what "
+                                << "cosmic-settings GUI does on toggle; "
+                                << "poll wlr-output for enabled=#false, "
+                                << "then 1500ms settle before next)";
 
                 // Spawn a detached thread to do the split applies so the
                 // capture loop continues pushing frames during the
@@ -1912,18 +1952,22 @@ namespace platf {
                              apply_done = scale_apply_done
                             ]() mutable {
                   // EVDI enable as safety net — should already be
-                  // enabled from init()'s pre-check, but the apply is
-                  // a no-op in that case.
+                  // enabled from init()'s pre-check, but the call is
+                  // a no-op on an already-enabled output. Use the
+                  // minimal cosmic-randr enable instead of full-world
+                  // kdl, matching the rest of the split-disable train.
                   if (!evdi.empty()) {
-                    apply_output_kdl_sync({}, {evdi});
+                    cosmic_randr_enable(evdi);
                     std::this_thread::sleep_for(std::chrono::milliseconds(300));
                   }
 
                   // Rollback helper: re-enable everything we disabled so
-                  // far. Called when an apply or health-check fails mid-way
-                  // through the split-disable train. Each re-enable goes
-                  // through the same atomic apply path; failures are logged
-                  // but the rollback continues — best effort.
+                  // far. Called when a disable or health-check fails mid-
+                  // way through the split-disable train. Each re-enable
+                  // is a minimal cosmic-randr enable (matching what we
+                  // used for the disables) so cosmic-comp processes
+                  // exactly one head transition per call. Failures are
+                  // logged but rollback continues — best effort.
                   std::vector<std::string> already_disabled;
                   auto rollback_partial = [&already_disabled, &inline_rb]
                                             (const std::string &reason) {
@@ -1940,7 +1984,7 @@ namespace platf {
                                        << " previous disables to keep the "
                                           "user's physicals on";
                     for (const auto &n : already_disabled) {
-                      if (!apply_output_kdl_sync({}, {n})) {
+                      if (!cosmic_randr_enable(n)) {
                         BOOST_LOG(warning) << "[evdi_grab] rollback re-enable "
                                               "of " << n << " also failed — "
                                               "compositor likely fully wedged, "
@@ -1959,9 +2003,19 @@ namespace platf {
                   for (const auto &name : targets) {
                     BOOST_LOG(info) << "[evdi_grab] Split disable: " << name;
                     auto t0 = std::chrono::steady_clock::now();
-                    if (!apply_output_kdl_sync({name}, {})) {
+                    // Minimal cosmic-randr disable: emits exactly
+                    // disable_head(target) + apply, leaving every
+                    // other head's state untouched. This is what
+                    // cosmic-settings GUI does on a display toggle.
+                    // The prior path (apply_output_kdl_sync) sent the
+                    // full-world config which caused cosmic-comp to
+                    // hold per-device compositor write locks longer
+                    // and re-evaluate every head, widening the window
+                    // for the surface-thread / Drop deadlock.
+                    if (!cosmic_randr_disable(name)) {
                       rollback_partial("Split disable of " + name +
-                                       " failed (apply timed out or errored)");
+                                       " failed (cosmic-randr exit != 0 "
+                                       "or timed out)");
                       return;
                     }
                     already_disabled.push_back(name);

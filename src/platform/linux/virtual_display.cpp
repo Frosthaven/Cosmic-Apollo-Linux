@@ -882,6 +882,73 @@ namespace VDISPLAY {
   // Public API Implementation
   // ============================================================================
 
+  // Returns true if any process other than ourselves currently holds an
+  // open fd to a DRM device backed by the EVDI driver. Used to gate the
+  // destructive /sys/devices/evdi/remove_all write in initVDisplayDriver:
+  // if cosmic-comp (or another compositor) still has /dev/dri/cardN open
+  // from a previous apollo run, tearing the device out of the kernel
+  // pulls cosmic-comp's DRM-master grip with it and the next hotplug
+  // hits smithay's `Unable to become drm master, assuming unprivileged
+  // mode` fail-soft, after which every modeset apply fails and the
+  // compositor is effectively wedged. Skipping remove_all leaves the
+  // existing AVAILABLE slot ready for find_or_create_slot to reuse,
+  // and the compositor never notices apollo restarted.
+  //
+  // Generic across hardware: card numbers vary by system (1× iGPU + 1×
+  // dGPU + EVDI gives /dev/dri/card3 here, but other configurations
+  // land EVDI at a different minor). We enumerate by driver name in
+  // sysfs rather than assuming a path.
+  static bool evdi_devices_held_by_other_process() {
+    std::vector<std::string> evdi_paths;
+    std::error_code ec;
+    for (auto &entry : fs::directory_iterator("/sys/class/drm", ec)) {
+      if (ec) break;
+      const std::string name = entry.path().filename().string();
+      // Only bare cardN, not cardN-... output subdirs.
+      if (name.rfind("card", 0) != 0) continue;
+      if (name.find('-') != std::string::npos) continue;
+      // Driver symlink target's basename tells us which driver owns it.
+      fs::path driver_link = entry.path() / "device" / "driver";
+      std::error_code rl_ec;
+      fs::path driver_target = fs::read_symlink(driver_link, rl_ec);
+      if (rl_ec) continue;
+      if (driver_target.filename().string() != "evdi") continue;
+      evdi_paths.emplace_back("/dev/dri/" + name);
+    }
+    if (evdi_paths.empty()) return false;
+
+    const pid_t self = ::getpid();
+    for (auto &proc_entry : fs::directory_iterator("/proc", ec)) {
+      if (ec) break;
+      const std::string pid_name = proc_entry.path().filename().string();
+      // PID directories only.
+      if (pid_name.empty() || !std::isdigit(static_cast<unsigned char>(pid_name[0]))) {
+        continue;
+      }
+      pid_t pid = 0;
+      try { pid = std::stoi(pid_name); } catch (...) { continue; }
+      if (pid <= 0 || pid == self) continue;
+      std::error_code fd_ec;
+      auto fd_iter = fs::directory_iterator(proc_entry.path() / "fd", fd_ec);
+      if (fd_ec) continue; // EACCES on processes we can't inspect — skip silently
+      for (auto &fd_entry : fd_iter) {
+        std::error_code link_ec;
+        fs::path target = fs::read_symlink(fd_entry.path(), link_ec);
+        if (link_ec) continue;
+        const std::string target_str = target.string();
+        for (const auto &p : evdi_paths) {
+          if (target_str == p) {
+            BOOST_LOG(info) << "[VDISPLAY] EVDI device " << p
+                            << " is held open by pid " << pid
+                            << " — preserving it (skipping remove_all)";
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   DRIVER_STATUS openVDisplayDevice() {
     std::lock_guard<std::mutex> lock(vdisplay_mutex);
 
@@ -910,12 +977,26 @@ namespace VDISPLAY {
       // resolution-change recreates within this run that haven't been
       // cleaned). cosmic-comp keeps fds open to all the EVDI slots it
       // ever saw, so without this they'd accumulate up to the kernel's
-      // 16-slot limit before exhausting. At startup apollo isn't
-      // streaming and cosmic-comp's render scheduler isn't actively
-      // flipping to any EVDI plane, so the remove_all is safe — the
-      // freeze-during-stream case the closeVDisplayDevice comment warns
-      // about doesn't apply here.
-      if (FILE *f = std::fopen("/sys/devices/evdi/remove_all", "w")) {
+      // 16-slot limit before exhausting.
+      //
+      // BUT: only if no other process still holds an EVDI device open.
+      // If apollo restarted (e.g. evdi_grab's "Falling back to apollo
+      // restart for monitor restore"), cosmic-comp still has the prior
+      // /dev/dri/cardN fd open. Tearing the device out of the kernel
+      // makes the next EVDI hotplug land in smithay's "Unable to become
+      // drm master, assuming unprivileged mode" branch — after that,
+      // every modeset apply fails inside drm.initialize_output and the
+      // compositor wedges. Better to keep the slot alive: when previous
+      // apollo's evdi_open fd closed, libevdi already flipped the slot
+      // to EVDI_AVAILABLE, so find_or_create_slot picks it up cleanly
+      // and the next session reuses the same /dev/dri/cardN without
+      // any new hotplug churn for the compositor to navigate.
+      if (evdi_devices_held_by_other_process()) {
+        BOOST_LOG(info) << "[VDISPLAY] Skipping remove_all: another process "
+                           "(likely cosmic-comp from a prior apollo run) still "
+                           "holds an EVDI device open. Existing AVAILABLE slots "
+                           "will be reused by find_or_create_slot.";
+      } else if (FILE *f = std::fopen("/sys/devices/evdi/remove_all", "w")) {
         std::fputc('1', f);
         std::fclose(f);
         BOOST_LOG(info) << "[VDISPLAY] Cleared leftover EVDI slots via remove_all";
