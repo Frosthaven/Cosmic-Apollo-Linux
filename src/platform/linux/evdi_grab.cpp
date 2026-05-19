@@ -1055,6 +1055,56 @@ namespace platf {
       return WIFEXITED(wrc) && WEXITSTATUS(wrc) == 0 && wrote == kdl.size();
     }
 
+    // Poll cosmic-randr list --kdl until the named output reports
+    // enabled=#false (or disappears from the listing), up to max_ms.
+    // Returns true on confirmation, false on timeout or list failure.
+    //
+    // This is the apply-confirmation gate for the split-disable train.
+    // The fixed-delay approach (sleep N ms then proceed) was unreliable
+    // at high resolutions: wlr-output-management's apply path returns
+    // before cosmic-comp's render scheduler has fully released the
+    // disabled Surface, and a second apply landing during that cleanup
+    // window deadlocks on shared backend state. Polling gives the
+    // responder as much time as it actually needs and also serves as
+    // the wedge detector — if list hangs or errors, the compositor is
+    // already in trouble and we should roll back instead of layering
+    // more applies on top.
+    bool poll_output_disabled(const std::string &name, int max_ms = 10000) {
+      auto deadline = std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(max_ms);
+      const std::string needle = "output \"" + name + "\"";
+      while (std::chrono::steady_clock::now() < deadline) {
+        std::string kdl;
+        FILE *p = ::popen("timeout 2 cosmic-randr list --kdl 2>/dev/null", "r");
+        if (!p) {
+          return false;
+        }
+        std::array<char, 4096> chunk;
+        while (auto n = ::fread(chunk.data(), 1, chunk.size(), p)) {
+          kdl.append(chunk.data(), n);
+        }
+        int rc = ::pclose(p);
+        if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0 || kdl.empty()) {
+          // cosmic-randr list itself hung or errored — compositor wedged.
+          return false;
+        }
+        size_t pos = kdl.find(needle);
+        if (pos == std::string::npos) {
+          // Output gone from listing — fully removed, treat as disabled.
+          return true;
+        }
+        size_t line_end = kdl.find('\n', pos);
+        std::string_view header(
+            kdl.data() + pos,
+            (line_end == std::string::npos ? kdl.size() - pos : line_end - pos));
+        if (header.find("enabled=#false") != std::string_view::npos) {
+          return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+      return false;
+    }
+
     class evdi_display_t: public display_t {
     public:
       evdi_display_t(const std::string &name, const video::config_t &config):
@@ -1659,16 +1709,6 @@ namespace platf {
             const bool is_desktop_session =
                 app == "Remote Input" || app == "Desktop" ||
                 app == "Low Res Desktop";
-            // Desktop-style sessions ALSO skip the physicals-disable train
-            // below. The split-disable triggers a known cosmic-comp deadlock
-            // (see surface/mod.rs Drop comment about apply_config_for_outputs)
-            // where dropping a physical's Surface mid-apply stalls the next
-            // apply indefinitely. Desktop streams have no reason to hide
-            // physicals — the user is just remoting into their normal Wayland
-            // session and seeing the full layout is the point. Game/app
-            // streams still get the disable to force fullscreen apps onto
-            // the EVDI.
-            const bool skip_physicals_disable = is_desktop_session;
             if (is_desktop_session) {
               BOOST_LOG(info) << "[evdi_grab] Keeping cosmic-comp autotile "
                                  "enabled for desktop-style session (app: "
@@ -1684,18 +1724,11 @@ namespace platf {
                                     "fullscreen-borderless games may tile";
             }
 
-            if (disabled_outputs_.empty() || skip_physicals_disable) {
-              // Three reasons to take this no-disable branch:
-              //   1. disabled_outputs_ is empty (find_compositor_layout saw
-              //      only the EVDI, or the user genuinely has no physicals)
-              //   2. desktop-style session — we deliberately keep physicals
-              //      on so the user's normal Wayland layout is visible on
-              //      the client (see skip_physicals_disable above)
-              //   3. (legacy) cosmic-comp wlr-output-management was
-              //      unresponsive at pre-flight — the path below catches
-              //      that and reroutes here too
-              // In all three cases, do NOTHING on disconnect. If we armed
-              // the restore,
+            if (disabled_outputs_.empty()) {
+              // No physicals tracked this session — either find_compositor_
+              // layout saw only the EVDI (race with cosmic-comp's hotplug
+              // settling) or the user genuinely has no physicals. Either
+              // way, do NOTHING on disconnect. If we armed the restore,
               // the destructor's force-disconnect of the EVDI would break
               // the resume path (cosmic-comp drops the EVDI output, and
               // the next "resume" RTSP session reuses the same launch_
@@ -1708,19 +1741,9 @@ namespace platf {
               // startup with the disabled-outputs state file + known-
               // physicals snapshot. No need to also try to be heroic
               // here.
-              if (skip_physicals_disable && !disabled_outputs_.empty()) {
-                BOOST_LOG(info) << "[evdi_grab] Skipping physicals disable for "
-                                << "desktop-style session (app: " << app
-                                << ", would-have-disabled=" << disabled_outputs_.size()
-                                << "). Workaround for cosmic-comp Surface Drop "
-                                   "deadlock during multi-output reconfigure on "
-                                   "the same apply chain. Physicals stay on; "
-                                   "user sees full desktop on client.";
-              } else {
-                BOOST_LOG(info) << "[evdi_grab] No physical outputs to disable "
-                                << "this session — skipping disable AND restore "
-                                << "(EVDI stays connected so resume works)";
-              }
+              BOOST_LOG(info) << "[evdi_grab] No physical outputs to disable "
+                              << "this session — skipping disable AND restore "
+                              << "(EVDI stays connected so resume works)";
               static thread_local bool logged_empty {false};
               logged_empty = true;
 
@@ -1854,8 +1877,9 @@ namespace platf {
                                 << disabled_outputs_.size()
                                 << " physicals (preserved " << modes.size()
                                 << " modes) via SPLIT kdl applies "
-                                << "(one output per apply, 500ms gap, "
-                                << "health-check between)";
+                                << "(one output per apply, poll wlr-output "
+                                << "for enabled=#false, then 1500ms settle "
+                                << "for render-thread cleanup before next)";
 
                 // Spawn a detached thread to do the split applies so the
                 // capture loop continues pushing frames during the
@@ -1934,26 +1958,44 @@ namespace platf {
 
                   for (const auto &name : targets) {
                     BOOST_LOG(info) << "[evdi_grab] Split disable: " << name;
+                    auto t0 = std::chrono::steady_clock::now();
                     if (!apply_output_kdl_sync({name}, {})) {
                       rollback_partial("Split disable of " + name +
                                        " failed (apply timed out or errored)");
                       return;
                     }
                     already_disabled.push_back(name);
-                    // Bumped from 500ms → 2000ms because 5K mode-sets need
-                    // more time for cosmic-comp to fully process each
-                    // transition before the next one lands; aggressive
-                    // gaps were the proximate cause of mid-train wedges.
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                    // Health check between applies. If cosmic-comp went
-                    // unresponsive after the last apply, roll back the
-                    // physicals we just disabled so we don't leave the
-                    // user with fewer outputs than they started with.
-                    if (!cosmic_comp_responsive(1500)) {
-                      rollback_partial("cosmic-comp went unresponsive after "
-                                       "disabling " + name);
+                    // Poll cosmic-randr for the disable to reflect in
+                    // wlr-output-management state, up to 10s. This replaces
+                    // the prior fixed sleep + responsiveness probe: the
+                    // fixed delay was insufficient at 5K (the apply returns
+                    // before cosmic-comp's render scheduler has released the
+                    // Surface; a second apply during that window deadlocks
+                    // on shared backend state). The poll also subsumes the
+                    // health check — if list hangs or errors, the
+                    // compositor is wedged and we roll back.
+                    if (!poll_output_disabled(name, 10000)) {
+                      rollback_partial("Output " + name + " did not report "
+                                       "enabled=#false within 10s — "
+                                       "cosmic-comp wedged or apply lost");
                       return;
                     }
+                    auto confirm_ms = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+                    BOOST_LOG(info) << "[evdi_grab] " << name
+                                    << " confirmed disabled after "
+                                    << confirm_ms << "ms";
+                    // Settle window after the apply is confirmed. The
+                    // wlr-output-management 'done' event fires when apply
+                    // returns, but the render backend thread for the
+                    // dropped Surface can still be cleaning up DRM
+                    // resources (see cosmic-comp's surface/mod.rs Drop:
+                    // it sends ThreadCommand::End but does NOT join the
+                    // thread because joining inside apply_config_for_outputs
+                    // deadlocks). A second apply landing during that
+                    // thread's wind-down is what we're trying to avoid.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
                   }
                   BOOST_LOG(info) << "[evdi_grab] Split disable sequence "
                                      "completed cleanly";
